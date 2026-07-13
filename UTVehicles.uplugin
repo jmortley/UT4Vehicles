@@ -1,0 +1,17 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "VersionName": "0.1",
+  "FriendlyName": "UTVehicles",
+  "Description": "Vehicle system for UT4 using UT3 vehicle meshes.",
+  "Category": "Gameplay",
+  "CreatedBy": "phantaci",
+  "CreatedByURL": "",
+  "Modules": [
+    {
+      "Name": "UTVehicles",
+      "Type" : "Runtime",
+      "WhitelistPlatforms" : [ "Win32", "Win64", "Linux" ]
+    }
+  ]
+}
