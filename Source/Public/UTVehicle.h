@@ -7,6 +7,11 @@
 
 class AUTHUD;
 class UCanvas;
+class UInputComponent;
+class UAudioComponent;
+class USoundBase;
+class USoundAttenuation;
+class UPrimitiveComponent;
 
 /**
  * Base class for wheeled vehicles in UT4.
@@ -31,12 +36,33 @@ public:
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = Camera)
 	class UCameraComponent* Camera;
 
+	/** Spatial engine loop whose pitch follows PhysX engine RPM. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = Audio)
+	UAudioComponent* EngineAudioComponent;
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = Audio)
+	USoundBase* EngineLoopSound;
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = Audio)
+	USoundBase* EngineStartSound;
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = Audio)
+	USoundBase* EngineStopSound;
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = Audio)
+	USoundBase* ImpactSound;
+
+	/** Shared 3D falloff used by the loop and one-shot vehicle sounds. */
+	UPROPERTY(Transient)
+	USoundAttenuation* VehicleSoundAttenuation;
+
 	// IUTTeamInterface
 	virtual uint8 GetTeamNum() const override;
 	virtual void SetTeamForSideSwap_Implementation(uint8 NewTeamNum) override;
 
 	// AActor
 	virtual void PostInitializeComponents() override;
+	virtual void Tick(float DeltaSeconds) override;
 
 	// APawn
 	virtual void SetupPlayerInputComponent(UInputComponent* PlayerInputComponent) override;
@@ -45,13 +71,24 @@ public:
 
 	// AActor
 	virtual void PostRender(class AUTHUD* HUD, UCanvas* Canvas);
+	virtual void PostRenderFor(APlayerController* PC, UCanvas* Canvas, FVector CameraPosition, FVector CameraDir) override;
+
+	// APawn
+	virtual void UnPossessed() override;
+	virtual void OnRep_Controller() override;
+
+	// AActor
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
 	/** Input handlers */
 	void OnThrottleInput(float Value);
+	void OnReverseInput(float Value);
 	void OnSteeringInput(float Value);
-	void OnBrakeInput(float Value);
+	void OnSteerLeftInput(float Value);
 	void OnHandbrakePressed();
 	void OnHandbrakeReleased();
+	void PlayEnterSound();
+	void PlayExitSound();
 
 	/** Server RPC: request to enter this vehicle */
 	UFUNCTION(Reliable, Server, WithValidation)
@@ -61,12 +98,51 @@ public:
 	UFUNCTION(Reliable, Server, WithValidation)
 	void ServerDriverLeave();
 
-	// ---- Option B prep ----
-	// To switch from auto-enter to key-press entry:
-	// 1. Add +ActionMappings=(ActionName="EnterVehicle",Key=E,...) to DefaultInput.ini
-	// 2. Remove the TryToDrive call from UTVehicleComponent::OnEntryTriggerBeginOverlap
-	// 3. Uncomment Tick below — it checks overlapping pawns each frame for E key press
-	//    and calls ServerTryEnter when detected.
-	//
-	// virtual void Tick(float DeltaTime) override;
+protected:
+	/**
+	 * Local camera view target. UT's camera manager forces a possessed pawn that
+	 * is not an AUTCharacter into FirstPerson, but explicitly honors an
+	 * ACameraActor as a normal component-driven view. This actor is attached to
+	 * Camera, so it inherits the SpringArm orbit and collision result exactly.
+	 */
+	UPROPERTY(Transient)
+	AActor* VehicleCameraActor;
+
+	// AUTPlayerController binds the movement axes on its own InputComponent
+	// (higher in the input stack than the pawn's) and consumes the keys while
+	// its handlers route to a null UTCharacter during driving — so pawn-level
+	// bindings only ever receive zeros. Driving uses a dedicated component
+	// explicitly pushed above the possessing controller's component.
+	void BindDrivingInput();
+	void UnbindDrivingInput();
+	void ActivateVehicleCamera();
+	void DeactivateVehicleCamera();
+	void UpdateVehicleAudio(float DeltaSeconds);
+
+	UFUNCTION()
+	void OnVehicleMeshHit(UPrimitiveComponent* HitComponent, AActor* OtherActor,
+		UPrimitiveComponent* OtherComponent, FVector NormalImpulse, const FHitResult& Hit);
+
+	/** Combine the four cached axis values into throttle/brake/steering */
+	void ApplyDriveInput();
+
+	/** Controller whose input stack currently carries our capture component */
+	UPROPERTY()
+	class APlayerController* BoundInputPC;
+
+	/**
+	 * Dedicated high-priority input component, mirroring the working BP
+	 * VehicleInputCaptureHellbender actor. Keeping the bindings off both the
+	 * pawn and controller components prevents UT's controller bindings from
+	 * consuming the movement keys first.
+	 */
+	UPROPERTY(Transient)
+	UInputComponent* DrivingInputComponent;
+
+	float ThrottleAxisValue;
+	float ReverseAxisValue;
+	float SteerRightAxisValue;
+	float SteerLeftAxisValue;
+	float NextDriveInputLogTime;
+	float LastImpactSoundTime;
 };

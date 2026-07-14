@@ -5,7 +5,10 @@
 
 class AUTCharacter;
 class AUTHUD;
+class APlayerController;
+class APawn;
 class UCanvas;
+class UInputComponent;
 
 UCLASS(meta = (BlueprintSpawnableComponent))
 class UTVEHICLES_API UUTVehicleComponent : public UActorComponent
@@ -68,6 +71,7 @@ public:
 
 	/** Draw vehicle HUD (health bar, speed, enter prompt) */
 	void DrawVehicleHUD(AUTHUD* HUD, UCanvas* Canvas, APlayerController* ViewingPC);
+	void DrawEntryPrompt(AUTHUD* HUD, UCanvas* Canvas, APlayerController* ViewingPC);
 
 	/** Set up the entry trigger sphere on the owning actor */
 	void InitEntryTrigger();
@@ -83,11 +87,9 @@ public:
 
 	bool HasDriver() const { return Driver != nullptr; }
 
-	/** Deferred entry — called next tick after overlap to avoid mid-physics-step issues */
-	void DeferredTryEnter();
-
 	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
 	virtual void BeginPlay() override;
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
 protected:
 	UFUNCTION()
@@ -97,9 +99,25 @@ protected:
 	UPROPERTY()
 	TArray<APawn*> OverlappingPawns;
 
-	/** Pawn waiting to enter next tick */
-	UPROPERTY()
-	APawn* PendingDriver;
+	/** High-priority local binding that consumes ActivateSpecial while in range. */
+	UPROPERTY(Transient)
+	UInputComponent* EntryInputComponent;
+
+	UPROPERTY(Transient)
+	APlayerController* EntryInputPC;
+
+	UPROPERTY(Transient)
+	APawn* EntryInputPawn;
+
+	/** Driver whose hidden/collision state was changed locally. */
+	UPROPERTY(Transient)
+	APawn* VisualDriver;
+
+	void SetDriverVisualState(APawn* DriverPawn, bool bDriving);
+	void BindEntryInput(APawn* LocalPawn);
+	void UnbindEntryInput();
+	void OnActivateSpecialPressed();
+	void RefreshEntryOwner();
 
 	/** Saved MaxSafeFallSpeed from driver character, restored on exit */
 	float SavedMaxSafeFallSpeed;

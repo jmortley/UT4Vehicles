@@ -83,7 +83,7 @@ void AUTVehicleFlying::SetupPlayerInputComponent(UInputComponent* PlayerInputCom
 	PlayerInputComponent->BindAction("Crouch", IE_Pressed, this, &AUTVehicleFlying::OnLiftDown);
 	PlayerInputComponent->BindAction("Crouch", IE_Released, this, &AUTVehicleFlying::OnLiftDownRelease);
 
-	PlayerInputComponent->BindAction("Use", IE_Pressed, this, &AUTVehicleFlying::ServerDriverLeave);
+	PlayerInputComponent->BindAction("ActivateSpecial", IE_Pressed, this, &AUTVehicleFlying::ServerDriverLeave);
 }
 
 void AUTVehicleFlying::OnThrottleInput(float Value)
@@ -173,6 +173,15 @@ void AUTVehicleFlying::PostRender(AUTHUD* HUD, UCanvas* Canvas)
 	}
 }
 
+void AUTVehicleFlying::PostRenderFor(APlayerController* PC, UCanvas* Canvas, FVector CameraPosition, FVector CameraDir)
+{
+	Super::PostRenderFor(PC, Canvas, CameraPosition, CameraDir);
+	if (VehicleComponent != nullptr && PC != nullptr)
+	{
+		VehicleComponent->DrawEntryPrompt(Cast<AUTHUD>(PC->MyHUD), Canvas, PC);
+	}
+}
+
 bool AUTVehicleFlying::ServerTryEnter_Validate(APawn* NewDriver)
 {
 	return true;
@@ -180,7 +189,8 @@ bool AUTVehicleFlying::ServerTryEnter_Validate(APawn* NewDriver)
 
 void AUTVehicleFlying::ServerTryEnter_Implementation(APawn* NewDriver)
 {
-	if (VehicleComponent != nullptr)
+	if (VehicleComponent != nullptr && NewDriver != nullptr &&
+		NewDriver->Controller != nullptr && GetOwner() == NewDriver->Controller)
 	{
 		VehicleComponent->TryToDrive(NewDriver);
 	}

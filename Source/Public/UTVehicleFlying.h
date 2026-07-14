@@ -51,6 +51,7 @@ public:
 
 	// AActor
 	virtual void PostRender(class AUTHUD* HUD, UCanvas* Canvas);
+	virtual void PostRenderFor(APlayerController* PC, UCanvas* Canvas, FVector CameraPosition, FVector CameraDir) override;
 
 	/** Input handlers */
 	void OnThrottleInput(float Value);

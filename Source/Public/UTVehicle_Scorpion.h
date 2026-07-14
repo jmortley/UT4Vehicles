@@ -12,6 +12,9 @@ UCLASS()
 class UTVEHICLES_API AUTVehicle_Scorpion : public AUTVehicle
 {
 	GENERATED_UCLASS_BODY()
+
+public:
+	virtual void PostInitializeComponents() override;
 };
 
 /** Front wheel for Scorpion - steerable, no handbrake */
