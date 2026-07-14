@@ -5,6 +5,7 @@
 #include "PhysicsEngine/BodySetup.h"
 #include "TireConfig.h"
 #include "Sound/SoundBase.h"
+#include "Sound/SoundWave.h"
 #include "Camera/CameraComponent.h"
 #include "GameFramework/SpringArmComponent.h"
 
@@ -153,21 +154,25 @@ AUTVehicle_Scorpion::AUTVehicle_Scorpion(const FObjectInitializer& ObjectInitial
 		Camera->SetFieldOfView(90.0f);
 	}
 
-	// The extracted Scorpion set includes its real collision cue but no engine
-	// loop. Reuse the working vehicle pack's engine/start/stop recordings as
-	// replaceable defaults until dedicated Scorpion recordings are imported.
+	// Use the original UT3 Scorpion recordings imported into the UT4 project.
+	// The engine wave is played directly, so explicitly loop it rather than
+	// relying on the AudioComponent to restart a finished one-shot.
 	static ConstructorHelpers::FObjectFinder<USoundBase> EngineLoopFinder(
-		TEXT("/Game/Mogno/Vehicles/Goliath/SFX/A_Vehicle_Goliath_EngineLoop01"));
+		TEXT("/Game/Mogno/Vehicles/ScorpionTest/SFX/A_Vehicle_Scorpion_EngineLoop01"));
 	static ConstructorHelpers::FObjectFinder<USoundBase> EngineStartFinder(
-		TEXT("/Game/Mogno/Vehicles/Goliath/SFX/A_Vehicle_Goliath_Start01"));
+		TEXT("/Game/Mogno/Vehicles/ScorpionTest/SFX/A_Vehicle_Scorpion_Start01"));
 	static ConstructorHelpers::FObjectFinder<USoundBase> EngineStopFinder(
-		TEXT("/Game/Mogno/Vehicles/Goliath/SFX/A_Vehicle_Goliath_Stop01"));
+		TEXT("/Game/Mogno/Vehicles/ScorpionTest/SFX/A_Vehicle_Scorpion_Stop01"));
 	static ConstructorHelpers::FObjectFinder<USoundBase> ImpactFinder(
 		TEXT("/Game/Mogno/Vehicles/ScorpionTest/SFX/A_Vehicle_Scorpion_Collide_Cue"));
 	EngineLoopSound = EngineLoopFinder.Object;
 	EngineStartSound = EngineStartFinder.Object;
 	EngineStopSound = EngineStopFinder.Object;
 	ImpactSound = ImpactFinder.Object;
+	if (USoundWave* EngineLoopWave = Cast<USoundWave>(EngineLoopSound))
+	{
+		EngineLoopWave->bLooping = true;
+	}
 
 	// 4W Movement Component setup
 	UWheeledVehicleMovementComponent4W* Movement4W = CastChecked<UWheeledVehicleMovementComponent4W>(GetVehicleMovementComponent());
