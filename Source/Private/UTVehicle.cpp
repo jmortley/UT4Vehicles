@@ -1,4 +1,5 @@
 #include "UTVehicle.h"
+#include "UTVehicleDamageType.h"
 #include "UTVehicleMeshComponent.h"
 #include "UnrealTournament.h"
 #include "WheeledVehicleMovementComponent.h"
@@ -11,11 +12,13 @@
 #include "Sound/SoundBase.h"
 #include "Sound/SoundAttenuation.h"
 #include "UTCharacter.h"
+#include "UTGameState.h"
 #include "UTPlayerController.h"
 #include "UTHUD.h"
 #include "Camera/CameraActor.h"
 #include "Camera/CameraComponent.h"
 #include "GameFramework/SpringArmComponent.h"
+#include "GameFramework/CharacterMovementComponent.h"
 #include "VehicleWheel.h"
 
 AUTVehicle::AUTVehicle(const FObjectInitializer& ObjectInitializer)
@@ -53,6 +56,10 @@ AUTVehicle::AUTVehicle(const FObjectInitializer& ObjectInitializer)
 	EngineStartSound = nullptr;
 	EngineStopSound = nullptr;
 	ImpactSound = nullptr;
+	MinRunOverSpeed = 250.0f;
+	RunOverDamageScale = 0.075f;
+	RunOverMomentumScale = 0.25f;
+	RanOverDamageType = UUTDmgType_RanOver::StaticClass();
 	VehicleSoundAttenuation = nullptr;
 
 	SetReplicates(true);
@@ -72,6 +79,8 @@ AUTVehicle::AUTVehicle(const FObjectInitializer& ObjectInitializer)
 	bAltFireInputDown = false;
 	NextDriveInputLogTime = 0.0f;
 	LastImpactSoundTime = -1000.0f;
+	LastRunOverTime = -1000.0f;
+	bVacantBrakeApplied = false;
 }
 
 void AUTVehicle::PostInitializeComponents()
@@ -145,6 +154,7 @@ void AUTVehicle::PostInitializeComponents()
 void AUTVehicle::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
+	UpdateVacantBrake();
 	UpdateVehicleAudio(DeltaSeconds);
 
 	// UT may auto-manage the active view target after possession callbacks.
@@ -212,6 +222,8 @@ void AUTVehicle::PlayExitSound()
 void AUTVehicle::OnVehicleMeshHit(UPrimitiveComponent* HitComponent, AActor* OtherActor,
 	UPrimitiveComponent* OtherComponent, FVector NormalImpulse, const FHitResult& Hit)
 {
+	TryRunOverPawn(OtherActor, Hit);
+
 	if (ImpactSound == nullptr || GetWorld() == nullptr || OtherActor == this)
 	{
 		return;
@@ -229,6 +241,58 @@ void AUTVehicle::OnVehicleMeshHit(UPrimitiveComponent* HitComponent, AActor* Oth
 	const float Volume = FMath::Clamp(FMath::Max(ImpactSpeed / 1400.0f, ImpulseStrength / 180000.0f), 0.20f, 1.0f);
 	UGameplayStatics::PlaySoundAtLocation(this, ImpactSound, Hit.ImpactPoint, Volume,
 		FMath::FRandRange(0.92f, 1.08f), 0.0f, VehicleSoundAttenuation);
+}
+
+void AUTVehicle::TryRunOverPawn(AActor* OtherActor, const FHitResult& Hit)
+{
+	if (Role != ROLE_Authority || GetWorld() == nullptr || OtherActor == nullptr || OtherActor == this)
+	{
+		return;
+	}
+
+	AUTCharacter* OtherCharacter = Cast<AUTCharacter>(OtherActor);
+	if (OtherCharacter == nullptr || OtherCharacter->IsDead() ||
+		(VehicleComponent != nullptr && VehicleComponent->Driver == OtherCharacter))
+	{
+		return;
+	}
+
+	const float Now = GetWorld()->GetTimeSeconds();
+	if (LastRunOverPawn.Get() == OtherCharacter && Now - LastRunOverTime < 0.5f)
+	{
+		return;
+	}
+
+	// Center-to-center approach speed works for forward, reverse, and side impacts
+	// without mistaking a pawn brushing an already stationary vehicle for roadkill.
+	const FVector RelativeVelocity = GetVelocity() - OtherCharacter->GetVelocity();
+	const FVector ToPawn = (OtherCharacter->GetActorLocation() - GetActorLocation()).GetSafeNormal2D();
+	const float ApproachSpeed = FVector::DotProduct(RelativeVelocity.GetSafeNormal2D(), ToPawn) *
+		RelativeVelocity.Size2D();
+	if (ApproachSpeed <= MinRunOverSpeed)
+	{
+		return;
+	}
+
+	AUTGameState* GameState = GetWorld()->GetGameState<AUTGameState>();
+	if (GameState != nullptr && GameState->OnSameTeam(this, OtherCharacter))
+	{
+		return;
+	}
+
+	const UCharacterMovementComponent* CharacterMovement = OtherCharacter->GetCharacterMovement();
+	const float PawnMass = CharacterMovement != nullptr ? CharacterMovement->Mass : 100.0f;
+	const float Damage = FMath::Max(1.0f, ApproachSpeed * RunOverDamageScale);
+	const FVector Momentum = RelativeVelocity * (RunOverMomentumScale * PawnMass);
+	AController* DamageInstigator = VehicleComponent != nullptr
+		? VehicleComponent->DamageInstigator
+		: Controller;
+
+	LastRunOverPawn = OtherCharacter;
+	LastRunOverTime = Now;
+	OtherCharacter->TakeDamage(Damage,
+		FUTPointDamageEvent(Damage, Hit, RelativeVelocity.GetSafeNormal(), RanOverDamageType, Momentum),
+		DamageInstigator, this);
 }
 
 uint8 AUTVehicle::GetTeamNum() const
@@ -517,9 +581,11 @@ void AUTVehicle::ApplyDriveInput()
 		Movement->SetTargetGear(Throttle > 0.0f ? 1 : -1, true);
 	}
 
+	bVacantBrakeApplied = false;
 	Movement->SetThrottleInput(Throttle);
 	Movement->SetBrakeInput(0.0f);
 	Movement->SetSteeringInput(Steering);
+	Movement->SetHandbrakeInput(bHandbrakeInputDown);
 
 	const float Now = GetWorld() != nullptr ? GetWorld()->GetTimeSeconds() : 0.0f;
 	if ((FMath::Abs(Throttle) > 0.01f || FMath::Abs(Steering) > 0.01f) && Now >= NextDriveInputLogTime)
@@ -560,6 +626,42 @@ void AUTVehicle::ApplyDriveInput()
 					bGroundHit ? *GetNameSafe(GroundHit.GetComponent()) : TEXT("NONE"));
 			}
 		}
+	}
+}
+
+bool AUTVehicle::ShouldApplyVacantBrake() const
+{
+	return VehicleComponent != nullptr && !VehicleComponent->HasDriver() && !VehicleComponent->bDead;
+}
+
+void AUTVehicle::UpdateVacantBrake()
+{
+	UWheeledVehicleMovementComponent* Movement = GetVehicleMovementComponent();
+	if (Movement == nullptr)
+	{
+		return;
+	}
+
+	if (ShouldApplyVacantBrake())
+	{
+		// A normal exit must not leave the drivetrain freewheeling. Service braking
+		// stops a moving vehicle; once nearly stopped, the handbrake holds it and
+		// prevents unloaded driven wheels from spinning against an obstruction.
+		Movement->SetThrottleInput(0.0f);
+		Movement->SetSteeringInput(0.0f);
+		Movement->SetBrakeInput(1.0f);
+		const bool bNearlyStopped = GetVelocity().Size2D() < 100.0f &&
+			FMath::Abs(Movement->GetForwardSpeed()) < 100.0f;
+		Movement->SetHandbrakeInput(bNearlyStopped);
+		bVacantBrakeApplied = true;
+	}
+	else if (bVacantBrakeApplied)
+	{
+		// Driver entry (or an armed Scorpion eject) releases only the automatic
+		// brake. A driver's own handbrake state remains authoritative.
+		Movement->SetBrakeInput(0.0f);
+		Movement->SetHandbrakeInput(bHandbrakeInputDown);
+		bVacantBrakeApplied = false;
 	}
 }
 

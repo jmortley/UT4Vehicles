@@ -70,6 +70,34 @@ public:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Scorpion|Boost")
 	float BoostDamageMultiplier;
 
+	/** Maximum extra downward acceleration while the chassis is close to drivable ground. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Scorpion|Handling")
+	float GroundDownforceAcceleration;
+
+	/** Forward speed at which the full ground-downforce acceleration is applied. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Scorpion|Handling")
+	float GroundDownforceTargetSpeed;
+
+	/** Ground distance used to disengage downforce cleanly when the Scorpion jumps. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Scorpion|Handling")
+	float GroundStabilityTraceDistance;
+
+	/** Angular acceleration that resists chassis roll and pitch relative to the road. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Scorpion|Handling")
+	float GroundUprightAcceleration;
+
+	/** Direct roll damping used only while the chassis is close to drivable ground. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Scorpion|Handling")
+	float GroundRollDamping;
+
+	/** Direct pitch damping used only while the chassis is close to drivable ground. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Scorpion|Handling")
+	float GroundPitchDamping;
+
+	/** Direct planar deceleration applied after an ordinary driver exit. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Scorpion|Handling")
+	float VacantStopDeceleration;
+
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Scorpion|Self Destruct")
 	float SelfDestructMinBoostTime;
 
@@ -92,12 +120,19 @@ public:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Scorpion|Self Destruct")
 	float ArmedDamageMultiplier;
 
+	/** Client-safe HUD predicate for when ActivateSpecial will arm boost-eject. */
+	bool IsBoostEjectReady() const;
+
+	/** Replication-safe HUD predicate shown for the full ordinary boost window. */
+	bool ShouldShowBoostEjectPrompt() const;
+
 protected:
 	virtual void OnHandbrakePressed() override;
 	virtual void OnHandbrakeReleased() override;
 	virtual void OnAltFirePressed() override;
 	virtual void OnAltFireReleased() override;
 	virtual bool HandleDriverLeaveRequest() override;
+	virtual bool ShouldApplyVacantBrake() const override;
 
 	UFUNCTION(Reliable, Server, WithValidation)
 	void ServerSetBladesExtended(bool bExtended);
@@ -130,6 +165,8 @@ protected:
 	bool StartBoost();
 	void StopBoost();
 	void ApplyBoostForce();
+	void ApplyGroundStability(float DeltaSeconds);
+	void ApplyVacantStop(float DeltaSeconds);
 	bool ReadyToSelfDestruct() const;
 	bool ArmSelfDestructAndEject();
 	void SelfDestructTimerExpired();

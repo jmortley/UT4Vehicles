@@ -153,6 +153,12 @@ void AUTVehicleFlying::BindDrivingInput()
 void AUTVehicleFlying::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
+	if (HoverMovement != nullptr)
+	{
+		const bool bShouldPark = VehicleComponent == nullptr ||
+			!VehicleComponent->HasDriver() || VehicleComponent->bDead;
+		HoverMovement->SetParkingMode(bShouldPark);
+	}
 
 	// UT's camera manager may replace the view target after possession callbacks
 	// because this is a non-character pawn. The wheeled path already repairs
@@ -269,6 +275,10 @@ void AUTVehicleFlying::ApplyFlightInput()
 {
 	if (HoverMovement != nullptr)
 	{
+		if (VehicleComponent != nullptr && VehicleComponent->HasDriver() && !VehicleComponent->bDead)
+		{
+			HoverMovement->SetParkingMode(false);
+		}
 		HoverMovement->SetThrottleInput(FMath::Clamp(ThrottleAxisValue - ReverseAxisValue, -1.0f, 1.0f));
 		HoverMovement->SetSteeringInput(FMath::Clamp(SteerRightAxisValue - SteerLeftAxisValue, -1.0f, 1.0f));
 	}
@@ -454,6 +464,10 @@ float AUTVehicleFlying::TakeDamage(float Damage, const FDamageEvent& DamageEvent
 void AUTVehicleFlying::PawnClientRestart()
 {
 	Super::PawnClientRestart();
+	if (HoverMovement != nullptr)
+	{
+		HoverMovement->SetParkingMode(false);
+	}
 	if (Camera != nullptr)
 	{
 		Camera->Activate();
@@ -466,6 +480,10 @@ void AUTVehicleFlying::UnPossessed()
 {
 	DeactivateVehicleCamera();
 	UnbindDrivingInput();
+	if (HoverMovement != nullptr)
+	{
+		HoverMovement->SetParkingMode(true);
+	}
 	Super::UnPossessed();
 }
 
@@ -476,9 +494,17 @@ void AUTVehicleFlying::OnRep_Controller()
 	{
 		DeactivateVehicleCamera();
 		UnbindDrivingInput();
+		if (HoverMovement != nullptr)
+		{
+			HoverMovement->SetParkingMode(true);
+		}
 	}
 	else if (IsLocallyControlled())
 	{
+		if (HoverMovement != nullptr)
+		{
+			HoverMovement->SetParkingMode(false);
+		}
 		ActivateVehicleCamera();
 		BindDrivingInput();
 	}

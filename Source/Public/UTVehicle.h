@@ -12,6 +12,7 @@ class UAudioComponent;
 class USoundBase;
 class USoundAttenuation;
 class UPrimitiveComponent;
+class UDamageType;
 
 /**
  * Base class for wheeled vehicles in UT4.
@@ -51,6 +52,21 @@ public:
 
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = Audio)
 	USoundBase* ImpactSound;
+
+	/** UT3-style minimum relative approach speed before a vehicle can run over a pawn. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Vehicle|Roadkill", meta = (ClampMin = "0.0"))
+	float MinRunOverSpeed;
+
+	/** UT3 RanInto damage is vehicle speed multiplied by 0.075. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Vehicle|Roadkill", meta = (ClampMin = "0.0"))
+	float RunOverDamageScale;
+
+	/** UT3 RanInto momentum is relative velocity multiplied by 0.25 and pawn mass. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Vehicle|Roadkill", meta = (ClampMin = "0.0"))
+	float RunOverMomentumScale;
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Vehicle|Roadkill")
+	TSubclassOf<UDamageType> RanOverDamageType;
 
 	/** Shared 3D falloff used by the loop and one-shot vehicle sounds. */
 	UPROPERTY(Transient)
@@ -121,6 +137,8 @@ protected:
 	void UnbindDrivingInput();
 	virtual void BindVehicleSpecificInput(UInputComponent* InputComponent);
 	virtual bool HandleDriverLeaveRequest();
+	/** Armed boost-eject vehicles override this so they remain free-running. */
+	virtual bool ShouldApplyVacantBrake() const;
 	void HandleHandbrakePressed();
 	void HandleHandbrakeReleased();
 	void HandlePrimaryFirePressed();
@@ -137,6 +155,8 @@ protected:
 
 	/** Combine the four cached axis values into throttle/brake/steering */
 	void ApplyDriveInput();
+	void UpdateVacantBrake();
+	void TryRunOverPawn(AActor* OtherActor, const FHitResult& Hit);
 
 	/** Controller whose input stack currently carries our capture component */
 	UPROPERTY()
@@ -162,4 +182,7 @@ protected:
 	bool bAltFireInputDown;
 	float NextDriveInputLogTime;
 	float LastImpactSoundTime;
+	float LastRunOverTime;
+	TWeakObjectPtr<APawn> LastRunOverPawn;
+	bool bVacantBrakeApplied;
 };

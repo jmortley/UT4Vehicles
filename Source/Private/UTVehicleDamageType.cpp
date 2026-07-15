@@ -60,3 +60,20 @@ UUTDmgType_ScorpionBlade::UUTDmgType_ScorpionBlade(const FObjectInitializer& Obj
 	GibHealthThreshold = MIN_int32;
 	GibDamageThreshold = MAX_int32;
 }
+
+UUTDmgType_RanOver::UUTDmgType_RanOver(const FObjectInitializer& ObjectInitializer)
+	: Super(ObjectInitializer)
+{
+	bBlockedByArmor = false;
+	bCausesBlood = true;
+	GibHealthThreshold = MIN_int32;
+	GibDamageThreshold = MAX_int32;
+	ConsoleDeathMessage = NSLOCTEXT("UTDeathMessages", "DeathMessage_RanOver",
+		"{Player1Name} ran over {Player2Name}.");
+	MaleSuicideMessage = NSLOCTEXT("UTDeathMessages", "MaleSuicideMessage_RanOver",
+		"{Player2Name} ran himself over.");
+	FemaleSuicideMessage = NSLOCTEXT("UTDeathMessages", "FemaleSuicideMessage_RanOver",
+		"{Player2Name} ran herself over.");
+	SelfVictimMessage = NSLOCTEXT("UTDeathMessages", "SelfVictimMessage_RanOver",
+		"You were run over.");
+}

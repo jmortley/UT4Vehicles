@@ -2,6 +2,7 @@
 #include "UTVehicle.h"
 #include "UTVehicleDamageType.h"
 #include "UTVehicleEntryProxy.h"
+#include "UTVehicle_Scorpion.h"
 #include "UnrealTournament.h"
 #include "UnrealNetwork.h"
 #include "Components/CapsuleComponent.h"
@@ -87,6 +88,22 @@ namespace
 
 		return DefaultScaling;
 	}
+
+	FString ResolveVehicleUseKey(APlayerController* PlayerController)
+	{
+		FString KeyName(TEXT("<none>"));
+		AUTPlayerController* UTPC = Cast<AUTPlayerController>(PlayerController);
+		if (UTPC != nullptr)
+		{
+			TArray<FString> Keys;
+			UTPC->ResolveKeybind(TEXT("ActivateSpecial"), Keys);
+			if (Keys.Num() > 0)
+			{
+				KeyName = Keys[0];
+			}
+		}
+		return KeyName;
+	}
 }
 
 UUTVehicleComponent::UUTVehicleComponent()
@@ -115,15 +132,11 @@ UUTVehicleComponent::UUTVehicleComponent()
 	HornAttenuation = nullptr;
 	LastHornTime = -1000.0f;
 
-	// UT3 exposes shared Axon/Necris horn banks rather than a Raptor-specific
-	// recording. Scorpion and Raptor are both small Axon vehicles, so they use
-	// the original SmallHuman horn. Future heavy/Necris classes can override the
-	// component default in their constructor or Blueprint defaults.
-	static ConstructorHelpers::FObjectFinder<USoundBase> HornFinder(
-		TEXT("/Game/Mogno/Vehicles/Common/SFX/Vehicle_Horn_SmallHuman01"));
-	static ConstructorHelpers::FObjectFinder<USoundBase> StockHornFallback(
+	// Use a stock sound that ships with this UT4 tree. Vehicle-specific horn
+	// banks can override the component default once their assets are imported.
+	static ConstructorHelpers::FObjectFinder<USoundBase> StockHornFinder(
 		TEXT("/Game/RestrictedAssets/Audio/Accessories/TrainHorn03"));
-	HornSound = HornFinder.Succeeded() ? HornFinder.Object : StockHornFallback.Object;
+	HornSound = StockHornFinder.Object;
 }
 
 void UUTVehicleComponent::SetDriverVisualState(APawn* DriverPawn, bool bDriving)
@@ -936,20 +949,8 @@ void UUTVehicleComponent::DrawEntryPrompt(AUTHUD* HUD, UCanvas* Canvas, APlayerC
 		return;
 	}
 
-	FString KeyName(TEXT("<none>"));
-	AUTPlayerController* UTPC = Cast<AUTPlayerController>(ViewingPC);
-	if (UTPC != nullptr)
-	{
-		TArray<FString> Keys;
-		UTPC->ResolveKeybind(TEXT("ActivateSpecial"), Keys);
-		if (Keys.Num() > 0)
-		{
-			KeyName = Keys[0];
-		}
-	}
-
 	FFormatNamedArguments PromptArgs;
-	PromptArgs.Add(TEXT("Key"), FText::FromString(KeyName));
+	PromptArgs.Add(TEXT("Key"), FText::FromString(ResolveVehicleUseKey(ViewingPC)));
 	const FText Prompt = FText::Format(
 		NSLOCTEXT("UTVehicles", "EnterVehiclePrompt", "Press {Key} to enter vehicle"),
 		PromptArgs);
@@ -1004,4 +1005,50 @@ void UUTVehicleComponent::DrawVehicleHUD(AUTHUD* HUD, UCanvas* Canvas, APlayerCo
 	float TextWidth, TextHeight;
 	Canvas->StrLen(GEngine->GetSmallFont(), HealthText, TextWidth, TextHeight);
 	Canvas->DrawText(GEngine->GetSmallFont(), HealthText, BarX + (BarWidth - TextWidth) * 0.5f, BarY - TextHeight - 2.0f);
+
+	// Occupants use the same remappable ActivateSpecial binding as vehicle entry.
+	// A boosting Scorpion replaces the ordinary exit hint with an unmistakable
+	// armed-eject prompt only when pressing the key will actually arm it.
+	APawn* VehiclePawn = Cast<APawn>(GetOwner());
+	if (ViewingPC == nullptr || VehiclePawn == nullptr || ViewingPC->GetPawn() != VehiclePawn)
+	{
+		return;
+	}
+
+	const AUTVehicle_Scorpion* Scorpion = Cast<AUTVehicle_Scorpion>(VehiclePawn);
+	// Driver replication can trail possession by a frame, so possession is the
+	// reliable local HUD gate. Show EJECT for the entire replicated boost window;
+	// readiness remains the server's authoritative action gate.
+	const bool bShowEjectPrompt = Scorpion != nullptr && Scorpion->ShouldShowBoostEjectPrompt();
+	FFormatNamedArguments PromptArgs;
+	PromptArgs.Add(TEXT("Key"), FText::FromString(ResolveVehicleUseKey(ViewingPC)));
+	const FText UsePrompt = FText::Format(
+		bShowEjectPrompt
+			? NSLOCTEXT("UTVehicles", "EjectScorpionPrompt", "Press {Key} to EJECT")
+			: NSLOCTEXT("UTVehicles", "ExitVehiclePrompt", "Press {Key} to exit vehicle"),
+		PromptArgs);
+	UFont* PromptFont = HUD->GetFontFromSizeIndex(bShowEjectPrompt ? 3 : 2);
+	if (PromptFont == nullptr)
+	{
+		return;
+	}
+
+	float PromptWidth = 0.0f;
+	float PromptHeight = 0.0f;
+	Canvas->TextSize(PromptFont, UsePrompt.ToString(), PromptWidth, PromptHeight);
+	const FVector2D PromptPosition((ScreenWidth - PromptWidth) * 0.5f,
+		ScreenHeight * (bShowEjectPrompt ? 0.58f : 0.68f));
+	const FLinearColor PromptColor = bShowEjectPrompt
+		? FLinearColor(1.0f, 0.18f, 0.03f, 1.0f)
+		: FLinearColor::White;
+	if (bShowEjectPrompt)
+	{
+		Canvas->SetDrawColor(0, 0, 0, 180);
+		Canvas->DrawTile(Canvas->DefaultTexture, PromptPosition.X - 16.0f,
+			PromptPosition.Y - 8.0f, PromptWidth + 32.0f, PromptHeight + 16.0f,
+			0.0f, 0.0f, 1.0f, 1.0f);
+	}
+	FCanvasTextItem PromptItem(PromptPosition, UsePrompt, PromptFont, PromptColor);
+	PromptItem.EnableShadow(FLinearColor::Black, FVector2D(1.0f, 2.0f));
+	Canvas->DrawItem(PromptItem);
 }

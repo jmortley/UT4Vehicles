@@ -18,6 +18,7 @@ class UTVEHICLES_API AUTVehicle_Goliath : public AUTVehicle
 
 public:
 	virtual void PostInitializeComponents() override;
+	virtual void BeginPlay() override;
 	virtual void Tick(float DeltaSeconds) override;
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
@@ -57,6 +58,9 @@ protected:
 	void SetCannonFiring(bool bNewFiring);
 	void FireCannon();
 	void ApplyTankSteering();
+	void UpdateVacantParking(float DeltaSeconds);
+	bool FindParkingGround(float& OutGroundZ, float& OutParkedActorZ) const;
+	float GetParkedHeightAboveGround() const;
 	FRotator GetCannonAimRotation() const;
 
 	bool bCannonFiring;

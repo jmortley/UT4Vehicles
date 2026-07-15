@@ -44,13 +44,13 @@ namespace
 			WheelSetup.AdditionalOffset = FVector::ZeroVector;
 		}
 
-		// The supplied Scorpion tire is 2.0 by default, which still lets the
-		// higher-output UT4-scale setup skate. This asset is Scorpion-specific,
-		// so raise its combined longitudinal/lateral grip before PhysX rebuilds.
+		// Excess lateral bite was levering the narrow chassis over before the tires
+		// slipped. Downforce supplies high-speed traction without making a low-speed
+		// steering input an instant rollover.
 		UTireConfig* ScorpionTire = UUTWheel_Scorpion_Front::StaticClass()->GetDefaultObject<UUTWheel_Scorpion_Front>()->TireConfig;
 		if (ScorpionTire != nullptr)
 		{
-			ScorpionTire->SetFrictionScale(3.5f);
+			ScorpionTire->SetFrictionScale(1.75f);
 		}
 
 		// Working BP vehicles use mesh-specific wheel offsets. Contact alone is not
@@ -84,10 +84,11 @@ namespace
 		// UT3's 950 uu/s cruise is slower than a UT4 dodge. Preserve the
 		// Scorpion curve shape at UT4 scale: full pull through about 1900 uu/s,
 		// taper at 2100, and a normal (non-boosted) top speed near 2300.
-		TorqueCurve->AddKey(0.0f, 500.0f);
-		TorqueCurve->AddKey(3225.5f, 500.0f);
-		TorqueCurve->AddKey(3565.1f, 80.0f);
-		TorqueCurve->AddKey(3904.6f, 0.0f);
+		// Preserve the heavier planted chassis, but restore the original power to
+		// weight ratio and keep useful torque through the intended 2300 uu/s range.
+		TorqueCurve->AddKey(0.0f, 680.0f);
+		TorqueCurve->AddKey(3600.0f, 680.0f);
+		TorqueCurve->AddKey(3900.0f, 150.0f);
 		TorqueCurve->AddKey(4000.0f, 0.0f);
 
 		Movement4W->TransmissionSetup.bUseGearAutoBox = true;
@@ -116,12 +117,34 @@ namespace
 		Movement4W->DifferentialSetup.FrontBias = 1.3f;
 		Movement4W->DifferentialSetup.RearBias = 1.3f;
 
+		Movement4W->Mass = 1600.0f;
+		// X is the longitudinal roll axis, Y is pitch, and Z is yaw. The old
+		// (1.0, 1.333, 1.333) values increased yaw resistance but left rollover
+		// resistance untouched. The Scorpion is an arcade combat car, so keep yaw
+		// responsive while making chassis roll much harder to start.
+		Movement4W->InertiaTensorScale = FVector(6.0f, 3.0f, 1.2f);
+		if (Mesh != nullptr)
+		{
+			// Live sprung-load telemetry showed the imported chassis placing only
+			// about 9% of its static load on the front axle. The wheelbase needs the
+			// COM roughly 47 uu farther forward for an even axle split. This mesh's
+			// forward direction is +X (opposite the raw UT3 COMOffset convention).
+			Mesh->BodyInstance.COMNudge = FVector(48.0f, 0.0f, -80.0f);
+			if (Mesh->BodyInstance.IsValidBodyInstance())
+			{
+				// PostInitializeComponents can inherit serialized BodyInstance values.
+				// Updating the field alone does not move PhysX's already-created COM.
+				Mesh->BodyInstance.UpdateMassProperties();
+			}
+		}
+
 		FRichCurve* SteeringCurve = Movement4W->SteeringCurve.GetRichCurve();
 		SteeringCurve->Reset();
 		// UE4's curve input is km/h. These are the original UT3 Scorpion steering
 		// angles with the speed axis doubled for the new 2300 uu/s UT4 target.
-		SteeringCurve->AddKey(0.0f, 1.0f);
-		SteeringCurve->AddKey(43.2f, 0.333f);
+		SteeringCurve->AddKey(0.0f, 0.60f);
+		SteeringCurve->AddKey(15.0f, 0.48f);
+		SteeringCurve->AddKey(43.2f, 0.28f);
 		SteeringCurve->AddKey(79.2f, 0.222f);
 		SteeringCurve->AddKey(93.6f, 0.133f);
 		SteeringCurve->AddKey(115.2f, 0.022f);
@@ -148,6 +171,13 @@ AUTVehicle_Scorpion::AUTVehicle_Scorpion(const FObjectInitializer& ObjectInitial
 	BoostTargetSpeed = 3800.0f;
 	BoostAcceleration = 7000.0f;
 	BoostDamageMultiplier = 1.5f;
+	GroundDownforceAcceleration = 3200.0f;
+	GroundDownforceTargetSpeed = 1800.0f;
+	GroundStabilityTraceDistance = 250.0f;
+	GroundUprightAcceleration = 35.0f;
+	GroundRollDamping = 12.0f;
+	GroundPitchDamping = 7.0f;
+	VacantStopDeceleration = 6000.0f;
 	SelfDestructMinBoostTime = 0.15f;
 	SelfDestructMinSpeed = 1800.0f;
 	SelfDestructFuseDuration = 1.0f;
@@ -225,16 +255,6 @@ AUTVehicle_Scorpion::AUTVehicle_Scorpion(const FObjectInitializer& ObjectInitial
 	UWheeledVehicleMovementComponent4W* Movement4W = CastChecked<UWheeledVehicleMovementComponent4W>(GetVehicleMovementComponent());
 	ConfigureScorpionDriveFromWorkingBP(Movement4W, GetMesh());
 
-	// Mass override for arcade feel
-	Movement4W->Mass = 1200.0f;
-
-	// Lower center of mass so the vehicle doesn't topple.
-	// COMNudge shifts the COM relative to the physics body center. Negative Z = lower.
-	GetMesh()->BodyInstance.COMNudge = FVector(0.0f, 0.0f, -80.0f);
-
-	// Resist rolling via inertia tensor scaling (higher Y/Z = harder to tip)
-	Movement4W->InertiaTensorScale = FVector(1.0f, 1.333f, 1.333f);
-
 	// Note: ThrottleInputRate, BrakeInputRate, SteeringInputRate are protected
 	// in UWheeledVehicleMovementComponent. Tune via Blueprint defaults if needed.
 }
@@ -288,11 +308,15 @@ void AUTVehicle_Scorpion::PostInitializeComponents()
 		{
 			ScorpionPeakTorque = FMath::Max(ScorpionPeakTorque, TorqueKey.Value);
 		}
-		UE_LOG(LogTemp, Warning, TEXT("[VehiclePhysics] Applied Scorpion drive setup Physics=%d ChassisBone=%s ChassisZ=(%.2f..%.2f) WheelOffsetZ=(%.2f,%.2f,%.2f,%.2f) MeshClass=%s Tire=%s Friction=%.2f FinalRatio=%.2f PeakTorque=%.1f Diff=%d FrontSplit=%.2f"),
+		const FVector LocalCOM = GetMesh()->GetComponentTransform().InverseTransformPosition(
+			GetMesh()->GetCenterOfMass());
+		UE_LOG(LogTemp, Warning, TEXT("[VehiclePhysics] Applied Scorpion drive setup Physics=%d ChassisBone=%s ChassisZ=(%.2f..%.2f) COM=%s COMNudge=%s WheelOffsetZ=(%.2f,%.2f,%.2f,%.2f) MeshClass=%s Tire=%s Friction=%.2f FinalRatio=%.2f PeakTorque=%.1f Diff=%d FrontSplit=%.2f"),
 			Movement4W->HasValidPhysicsState() ? 1 : 0,
 			*ChassisBoneName,
 			ChassisBounds.IsValid ? ChassisBounds.Min.Z : 0.0f,
 			ChassisBounds.IsValid ? ChassisBounds.Max.Z : 0.0f,
+			*LocalCOM.ToString(),
+			*GetMesh()->BodyInstance.COMNudge.ToString(),
 			Movement4W->WheelSetups[0].AdditionalOffset.Z,
 			Movement4W->WheelSetups[1].AdditionalOffset.Z,
 			Movement4W->WheelSetups[2].AdditionalOffset.Z,
@@ -311,6 +335,15 @@ void AUTVehicle_Scorpion::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
 
+	// Wheeled physics runs on the server and on the locally controlled proxy.
+	// Simulated proxies receive the resulting replicated transform and must not
+	// apply a second, independent stabilization force.
+	if (Role == ROLE_Authority || IsLocallyControlled())
+	{
+		ApplyGroundStability(DeltaSeconds);
+	}
+	ApplyVacantStop(DeltaSeconds);
+
 	if (Role == ROLE_Authority)
 	{
 		if (bBladesExtended && !bSelfDestructArmed)
@@ -327,6 +360,90 @@ void AUTVehicle_Scorpion::Tick(float DeltaSeconds)
 			ApplyBoostForce();
 		}
 	}
+}
+
+void AUTVehicle_Scorpion::ApplyVacantStop(float DeltaSeconds)
+{
+	USkeletalMeshComponent* Mesh = GetMesh();
+	if (Mesh == nullptr || !Mesh->IsSimulatingPhysics() || VehicleComponent == nullptr ||
+		VehicleComponent->HasDriver() || VehicleComponent->bDead || bSelfDestructArmed)
+	{
+		return;
+	}
+
+	// Apply on every PhysX copy. The service brake still handles tire rotation;
+	// this removes the long neutral-like coast that remains after possession is
+	// cleared, without affecting the deliberately driverless armed eject car.
+	FVector Velocity = Mesh->GetPhysicsLinearVelocity();
+	FVector PlanarVelocity(Velocity.X, Velocity.Y, 0.0f);
+	PlanarVelocity = FMath::VInterpConstantTo(PlanarVelocity, FVector::ZeroVector,
+		DeltaSeconds, FMath::Max(VacantStopDeceleration, 0.0f));
+	Velocity.X = PlanarVelocity.X;
+	Velocity.Y = PlanarVelocity.Y;
+	Mesh->SetAllPhysicsLinearVelocity(Velocity);
+
+	FVector AngularVelocity = Mesh->GetPhysicsAngularVelocity();
+	AngularVelocity = FMath::VInterpConstantTo(AngularVelocity, FVector::ZeroVector,
+		DeltaSeconds, 540.0f);
+	Mesh->SetAllPhysicsAngularVelocity(AngularVelocity);
+	if (PlanarVelocity.SizeSquared() < FMath::Square(10.0f) && FMath::Abs(Velocity.Z) < 50.0f)
+	{
+		Velocity.X = 0.0f;
+		Velocity.Y = 0.0f;
+		Mesh->SetAllPhysicsLinearVelocity(Velocity);
+		Mesh->SetAllPhysicsAngularVelocity(FVector::ZeroVector);
+	}
+}
+
+void AUTVehicle_Scorpion::ApplyGroundStability(float DeltaSeconds)
+{
+	USkeletalMeshComponent* Mesh = GetMesh();
+	UWheeledVehicleMovementComponent4W* Movement4W =
+		Cast<UWheeledVehicleMovementComponent4W>(GetVehicleMovementComponent());
+	if (Mesh == nullptr || Movement4W == nullptr || !Mesh->IsSimulatingPhysics() ||
+		VehicleComponent == nullptr || VehicleComponent->bDead || GetWorld() == nullptr)
+	{
+		return;
+	}
+
+	const FVector ChassisUp = Mesh->GetUpVector();
+	// Do not pin an already overturned vehicle onto its side. The stabilizer is
+	// preventative and releases naturally once a real jump leaves the ground.
+	if (FVector::DotProduct(ChassisUp, FVector::UpVector) < 0.35f)
+	{
+		return;
+	}
+
+	const FVector TraceStart = Mesh->GetComponentLocation() + FVector::UpVector * 25.0f;
+	const FVector TraceEnd = TraceStart - FVector::UpVector * GroundStabilityTraceDistance;
+	FCollisionQueryParams QueryParams(FName(TEXT("ScorpionGroundStability")), false, this);
+	FHitResult GroundHit;
+	if (!GetWorld()->LineTraceSingleByChannel(GroundHit, TraceStart, TraceEnd,
+		ECC_WorldStatic, QueryParams))
+	{
+		return;
+	}
+
+	const FVector GroundNormal = GroundHit.ImpactNormal.GetSafeNormal();
+	const float PlanarSpeed = FVector::VectorPlaneProject(Mesh->GetPhysicsLinearVelocity(), GroundNormal).Size();
+	const float SpeedAlpha = FMath::Clamp(PlanarSpeed / FMath::Max(GroundDownforceTargetSpeed, 1.0f), 0.0f, 1.0f);
+	// Squared speed gives the familiar aerodynamic downforce curve. bAccelChange
+	// keeps the handling tune independent of any later mass adjustment.
+	Mesh->AddForce(-GroundNormal * GroundDownforceAcceleration * SpeedAlpha * SpeedAlpha,
+		NAME_None, true);
+
+	const FVector UprightAxis = FVector::CrossProduct(ChassisUp, GroundNormal);
+	Mesh->AddTorque(UprightAxis * GroundUprightAcceleration, NAME_None, true);
+
+	// Retain yaw authority, but bleed roll/pitch angular velocity before load can
+	// transfer far enough to lift an entire side of the car.
+	const FTransform MeshTransform = Mesh->GetComponentTransform();
+	FVector LocalAngularVelocity = MeshTransform.InverseTransformVectorNoScale(
+		Mesh->GetPhysicsAngularVelocity());
+	LocalAngularVelocity.X *= FMath::Exp(-GroundRollDamping * DeltaSeconds);
+	LocalAngularVelocity.Y *= FMath::Exp(-GroundPitchDamping * DeltaSeconds);
+	Mesh->SetPhysicsAngularVelocity(
+		MeshTransform.TransformVectorNoScale(LocalAngularVelocity), false);
 }
 
 void AUTVehicle_Scorpion::EndPlay(const EEndPlayReason::Type EndPlayReason)
@@ -410,6 +527,13 @@ bool AUTVehicle_Scorpion::HandleDriverLeaveRequest()
 		SetBladesExtended(false);
 	}
 	return Super::HandleDriverLeaveRequest();
+}
+
+bool AUTVehicle_Scorpion::ShouldApplyVacantBrake() const
+{
+	// Armed boost-eject is intentionally a driverless projectile. Every other
+	// Scorpion exit gets the shared automatic vacant-vehicle brake.
+	return !bSelfDestructArmed && Super::ShouldApplyVacantBrake();
 }
 
 bool AUTVehicle_Scorpion::ServerSetBladesExtended_Validate(bool)
@@ -676,10 +800,23 @@ void AUTVehicle_Scorpion::ApplyBoostForce()
 
 bool AUTVehicle_Scorpion::ReadyToSelfDestruct() const
 {
-	return Role == ROLE_Authority && GetWorld() != nullptr && VehicleComponent != nullptr &&
+	return Role == ROLE_Authority && IsBoostEjectReady();
+}
+
+bool AUTVehicle_Scorpion::IsBoostEjectReady() const
+{
+	return GetWorld() != nullptr && VehicleComponent != nullptr &&
 		VehicleComponent->HasDriver() && !VehicleComponent->bDead && bBoostersActivated &&
 		!bSelfDestructArmed && GetWorld()->GetTimeSeconds() - BoostStartTime >= SelfDestructMinBoostTime &&
 		GetVelocity().Size() >= SelfDestructMinSpeed;
+}
+
+bool AUTVehicle_Scorpion::ShouldShowBoostEjectPrompt() const
+{
+	const bool bLocallyOccupied = Controller != nullptr ||
+		(VehicleComponent != nullptr && VehicleComponent->HasDriver());
+	return VehicleComponent != nullptr && bLocallyOccupied &&
+		!VehicleComponent->bDead && bBoostersActivated && !bSelfDestructArmed;
 }
 
 bool AUTVehicle_Scorpion::ArmSelfDestructAndEject()
@@ -718,6 +855,17 @@ bool AUTVehicle_Scorpion::ArmSelfDestructAndEject()
 
 void AUTVehicle_Scorpion::OnRep_BoostState()
 {
+	if (Role < ROLE_Authority && bBoostersActivated && !bSelfDestructArmed && GetWorld() != nullptr)
+	{
+		// BoostStartTime is an authority timer. Give the owning client's HUD the
+		// same short arming delay from the moment replicated boost begins.
+		BoostStartTime = GetWorld()->GetTimeSeconds();
+	}
+	UE_LOG(LogTemp, Warning, TEXT("[ScorpionBoost] Rep Vehicle=%s Role=%d Local=%d Active=%d Armed=%d Speed=%.1f Prompt=%d Ready=%d"),
+		*GetName(), (int32)Role, IsLocallyControlled() ? 1 : 0,
+		bBoostersActivated ? 1 : 0, bSelfDestructArmed ? 1 : 0,
+		GetVelocity().Size(), ShouldShowBoostEjectPrompt() ? 1 : 0,
+		IsBoostEjectReady() ? 1 : 0);
 	const float NewFOV = (bBoostersActivated || bSelfDestructArmed) ? 105.0f : 90.0f;
 	if (Camera != nullptr)
 	{
@@ -883,23 +1031,27 @@ UUTWheel_Scorpion_Front::UUTWheel_Scorpion_Front()
 	ShapeWidth = 30.0f;
 	Mass = 20.0f;
 	DampingRate = 0.25f;
-	SteerAngle = 40.0f;
+	SteerAngle = 30.0f;
 	bAffectedByHandbrake = false;
 
 	// Tire grip
 	LatStiffMaxLoad = 2.0f;
-	LatStiffValue = 25.0f;
-	LongStiffValue = 1500.0f;
+	LatStiffValue = 18.0f;
+	LongStiffValue = 1400.0f;
 
-	// Suspension - generous travel for UT3 mesh scale
-	SuspensionForceOffset = 0.0f;
-	SuspensionMaxRaise = 40.0f;
-	SuspensionMaxDrop = 40.0f;
-	SuspensionNaturalFrequency = 9.0f;
-	SuspensionDampingRatio = 1.5f;
+	// The chassis bottom is 19.5 uu above the tire contact at rest. More than
+	// 15 uu compression therefore puts chassis collision through the floor.
+	// Apply tire/spring forces nearer the COM to reduce squat and body roll.
+	SuspensionForceOffset = -30.0f;
+	SuspensionMaxRaise = 15.0f;
+	// 15 compression + 22 droop gives the 37 uu locked travel from UT3 and
+	// prevents the old 36 uu nose extension that made the tail hit the floor.
+	SuspensionMaxDrop = 22.0f;
+	SuspensionNaturalFrequency = 10.5f;
+	SuspensionDampingRatio = 1.25f;
 
 	// Brakes
-	MaxBrakeTorque = 3000.0f;
+	MaxBrakeTorque = 6000.0f;
 	MaxHandBrakeTorque = 0.0f;
 }
 
@@ -921,17 +1073,17 @@ UUTWheel_Scorpion_Rear::UUTWheel_Scorpion_Rear()
 
 	// Tire grip
 	LatStiffMaxLoad = 2.0f;
-	LatStiffValue = 25.0f;
-	LongStiffValue = 1500.0f;
+	LatStiffValue = 18.0f;
+	LongStiffValue = 1400.0f;
 
-	// Suspension - generous travel for UT3 mesh scale
-	SuspensionForceOffset = 0.0f;
-	SuspensionMaxRaise = 40.0f;
-	SuspensionMaxDrop = 40.0f;
-	SuspensionNaturalFrequency = 9.0f;
-	SuspensionDampingRatio = 1.5f;
+	// Match the front axle's bounded, critically controlled suspension.
+	SuspensionForceOffset = -30.0f;
+	SuspensionMaxRaise = 15.0f;
+	SuspensionMaxDrop = 22.0f;
+	SuspensionNaturalFrequency = 10.5f;
+	SuspensionDampingRatio = 1.25f;
 
 	// Brakes
-	MaxBrakeTorque = 2000.0f;
-	MaxHandBrakeTorque = 6000.0f;
+	MaxBrakeTorque = 5000.0f;
+	MaxHandBrakeTorque = 8000.0f;
 }

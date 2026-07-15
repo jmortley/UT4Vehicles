@@ -1,5 +1,8 @@
 #pragma once
 
+#include "CoreMinimal.h"
+#include "Components/SphereComponent.h"
+#include "GameFramework/ProjectileMovementComponent.h"
 #include "UTProjectile.h"
 #include "UTProj_TankShell.generated.h"
 

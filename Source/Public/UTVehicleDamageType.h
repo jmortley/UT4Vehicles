@@ -1,5 +1,10 @@
 #pragma once
 
+#include "CoreMinimal.h"
+#include "Engine/Font.h"
+#include "GameFramework/PlayerInput.h"
+#include "Curves/CurveLinearColor.h"
+#include "Engine/Canvas.h"
 #include "UTDamageType.h"
 #include "UTVehicleDamageType.generated.h"
 
@@ -67,6 +72,13 @@ class UTVEHICLES_API UUTDmgType_ScorpionSelfDestruct : public UUTVehicleDamageTy
 /** UT3 Scorpion blade: armor-piercing, non-gibbing fatal contact damage. */
 UCLASS(Blueprintable)
 class UTVEHICLES_API UUTDmgType_ScorpionBlade : public UUTDamageType
+{
+	GENERATED_UCLASS_BODY()
+};
+
+/** UT3-style credited, non-gibbing roadkill damage. */
+UCLASS(Blueprintable)
+class UTVEHICLES_API UUTDmgType_RanOver : public UUTDamageType
 {
 	GENERATED_UCLASS_BODY()
 };

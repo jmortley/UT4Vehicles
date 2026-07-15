@@ -1,10 +1,8 @@
 #include "UTProj_TankShell.h"
-#include "UnrealTournament.h"
 #include "UTVehicleDamageType.h"
-#include "Components/SphereComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "Engine/StaticMesh.h"
-#include "GameFramework/ProjectileMovementComponent.h"
+#include "UObject/ConstructorHelpers.h"
 
 AUTProj_TankShell::AUTProj_TankShell(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)

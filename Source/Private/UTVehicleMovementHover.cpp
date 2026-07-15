@@ -22,11 +22,14 @@ UUTVehicleMovementHover::UUTVehicleMovementHover()
 	HoverVerticalDamping = 6.0f;
 	ParkedGroundClearance = 60.0f;
 	ParkedDescentSpeed = 400.0f;
+	ParkedHorizontalDeceleration = 3500.0f;
+	ParkedGroundSearchDistance = 20000.0f;
 
 	RawThrottleInput = 0.0f;
 	RawSteeringInput = 0.0f;
 	RawLiftInput = 0.0f;
 	RawPitchInput = 0.0f;
+	bParkingMode = true;
 }
 
 void UUTVehicleMovementHover::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
@@ -55,6 +58,26 @@ void UUTVehicleMovementHover::SetPitchInput(float Value)
 	RawPitchInput = FMath::Clamp(Value, -1.0f, 1.0f);
 }
 
+void UUTVehicleMovementHover::SetParkingMode(bool bEnabled)
+{
+	if (bParkingMode == bEnabled)
+	{
+		return;
+	}
+
+	bParkingMode = bEnabled;
+	if (bParkingMode)
+	{
+		RawThrottleInput = 0.0f;
+		RawSteeringInput = 0.0f;
+		RawLiftInput = 0.0f;
+		RawPitchInput = 0.0f;
+	}
+
+	UE_LOG(LogTemp, Warning, TEXT("[VehicleHoverParking] Vehicle=%s Enabled=%d Speed=%.1f GroundDistance=%.1f"),
+		*GetNameSafe(GetOwner()), bParkingMode ? 1 : 0, Velocity.Size(), GetGroundDistance());
+}
+
 float UUTVehicleMovementHover::GetCurrentSpeed() const
 {
 	return Velocity.Size();
@@ -69,7 +92,8 @@ float UUTVehicleMovementHover::GetGroundDistance() const
 	}
 
 	FVector Start = Owner->GetActorLocation();
-	FVector End = Start - FVector(0.0f, 0.0f, MaxAltitude + 1000.0f);
+	const float TraceDistance = FMath::Max(MaxAltitude + 1000.0f, ParkedGroundSearchDistance);
+	FVector End = Start - FVector(0.0f, 0.0f, TraceDistance);
 
 	FHitResult Hit;
 	FCollisionQueryParams Params;
@@ -102,7 +126,7 @@ void UUTVehicleMovementHover::TickComponent(float DeltaTime, ELevelTick TickType
 	// On server or standalone: apply physics
 	if (Owner->Role == ROLE_Authority)
 	{
-		if (Owner->Controller == nullptr)
+		if (bParkingMode || Owner->Controller == nullptr)
 		{
 			UpdateParkedPhysics(DeltaTime);
 		}
@@ -144,26 +168,40 @@ void UUTVehicleMovementHover::UpdateParkedPhysics(float DeltaTime)
 		return;
 	}
 
-	// UT3 flyers rest on their landing gear until somebody enters. Do not run
-	// the active hover spring while empty: gravity and repulsion otherwise trade
-	// energy and make the parked vehicle bob forever.
+	// UT3 flyers return to their landing gear after the driver exits. Brake the
+	// inherited planar velocity hard enough to stay near the exit point, but do
+	// not teleport to a stop; vertical motion is separately capped below.
 	RawThrottleInput = 0.0f;
 	RawSteeringInput = 0.0f;
 	RawLiftInput = 0.0f;
 	RawPitchInput = 0.0f;
-	Velocity = FVector::ZeroVector;
+	FVector PlanarVelocity(Velocity.X, Velocity.Y, 0.0f);
+	PlanarVelocity = FMath::VInterpConstantTo(PlanarVelocity, FVector::ZeroVector,
+		DeltaTime, FMath::Max(ParkedHorizontalDeceleration, 0.0f));
+	Velocity.X = PlanarVelocity.X;
+	Velocity.Y = PlanarVelocity.Y;
 
 	const float GroundDistance = GetGroundDistance();
 	const float VerticalCorrection = ParkedGroundClearance - GroundDistance;
 	const float MaxStep = FMath::Max(ParkedDescentSpeed, 0.0f) * DeltaTime;
 	const float MoveZ = FMath::Clamp(VerticalCorrection, -MaxStep, MaxStep);
+	Velocity.Z = DeltaTime > SMALL_NUMBER ? MoveZ / DeltaTime : 0.0f;
 
 	FRotator ParkedRotation = Owner->GetActorRotation();
 	ParkedRotation.Pitch = FMath::FInterpTo(ParkedRotation.Pitch, 0.0f, DeltaTime, 4.0f);
 	ParkedRotation.Roll = FMath::FInterpTo(ParkedRotation.Roll, 0.0f, DeltaTime, 4.0f);
 
 	FHitResult Hit;
-	SafeMoveUpdatedComponent(FVector(0.0f, 0.0f, MoveZ), ParkedRotation, true, Hit);
+	SafeMoveUpdatedComponent(FVector(Velocity.X * DeltaTime, Velocity.Y * DeltaTime, MoveZ),
+		ParkedRotation, true, Hit);
+	if (Hit.IsValidBlockingHit())
+	{
+		Velocity -= Hit.Normal * FVector::DotProduct(Velocity, Hit.Normal);
+	}
+	if (FMath::Abs(VerticalCorrection) <= 2.0f && PlanarVelocity.SizeSquared() < FMath::Square(StopThreshold))
+	{
+		Velocity = FVector::ZeroVector;
+	}
 }
 
 void UUTVehicleMovementHover::UpdateFlightPhysics(float DeltaTime)

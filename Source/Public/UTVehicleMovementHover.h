@@ -111,6 +111,14 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Movement)
 	float ParkedDescentSpeed;
 
+	/** Planar deceleration used while an empty flyer is returning to the ground. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Movement, meta = (ClampMin = "0.0"))
+	float ParkedHorizontalDeceleration;
+
+	/** Downward trace distance used to find a landing surface after exit. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Movement, meta = (ClampMin = "0.0"))
+	float ParkedGroundSearchDistance;
+
 	// --- Input ---
 
 	/** Set throttle input (-1 to 1) */
@@ -124,6 +132,9 @@ public:
 
 	/** Set pitch input from mouse look */
 	void SetPitchInput(float Value);
+
+	/** Explicit vacancy state; authority uses this instead of controller timing. */
+	void SetParkingMode(bool bEnabled);
 
 	// --- Replication ---
 
@@ -149,6 +160,7 @@ protected:
 	float RawSteeringInput;
 	float RawLiftInput;
 	float RawPitchInput;
+	bool bParkingMode;
 
 	/** Apply physics simulation for one tick */
 	void UpdateFlightPhysics(float DeltaTime);
