@@ -37,6 +37,14 @@ public:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Replicated, Category = Vehicle)
 	int32 HealthMax;
 
+	/** UT3 light armor receives extra damage from sniper primary and tank shells. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Vehicle|Damage")
+	bool bLightArmor;
+
+	/** Scaling used for environmental, custom, or otherwise unrecognized damage types. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Vehicle|Damage", meta = (ClampMin = "0.0"))
+	float DefaultVehicleDamageScaling;
+
 	/** Team number (255 = no team) */
 	UPROPERTY(BlueprintReadOnly, Replicated, Category = Vehicle)
 	uint8 TeamNum;
@@ -157,6 +165,7 @@ protected:
 	void EnsureEntryProxy(AController* Controller);
 	bool DriverLeaveInternal(bool bForceLeave, bool bEject, const FVector& EjectVelocity, bool bInheritVehicleVelocity);
 	bool FindSafeExitLocation(AUTCharacter* Character, FVector& OutLocation, FRotator& OutRotation) const;
+	float CalculateVehicleDamage(float Damage, const FDamageEvent& DamageEvent) const;
 
 	/** Saved MaxSafeFallSpeed from driver character, restored on exit */
 	float SavedMaxSafeFallSpeed;

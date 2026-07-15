@@ -1,5 +1,6 @@
 #include "UTVehicleComponent.h"
 #include "UTVehicle.h"
+#include "UTVehicleDamageType.h"
 #include "UTVehicleEntryProxy.h"
 #include "UnrealTournament.h"
 #include "UnrealNetwork.h"
@@ -15,6 +16,79 @@
 #include "UTGameState.h"
 #include "UTHUD.h"
 
+namespace
+{
+	struct FUT3VehicleDamageRule
+	{
+		FUT3VehicleDamageRule(const TCHAR* InClassName, float InScaling, bool bInSniperPrimary = false)
+			: ClassName(InClassName)
+			, Scaling(InScaling)
+			, bSniperPrimary(bInSniperPrimary)
+		{
+		}
+
+		FName ClassName;
+		float Scaling;
+		bool bSniperPrimary;
+	};
+
+	float GetStockVehicleDamageScaling(UClass* DamageTypeClass, bool bLightArmor, float DefaultScaling)
+	{
+		// UT4 keeps these as unrelated Blueprint-generated UUTDamageType classes,
+		// so native inheritance cannot recover the per-weapon values from UT3.
+		// Walk parents as well so a Blueprint child inherits its parent's rule.
+		static const FUT3VehicleDamageRule Rules[] =
+		{
+			FUT3VehicleDamageRule(TEXT("UTDmg_ImpactHammer_C"), 0.2f),
+			FUT3VehicleDamageRule(TEXT("UTDmg_ImpactHammerBlock_C"), 1.0f),
+			FUT3VehicleDamageRule(TEXT("UTDMG_Enforcer_C"), 0.33f),
+			FUT3VehicleDamageRule(TEXT("UTDmg_BioGoo_C"), 0.8f),
+			FUT3VehicleDamageRule(TEXT("UTDmg_BioGoo_Charged_C"), 0.8f),
+			FUT3VehicleDamageRule(TEXT("UTDmg_BioCloud_C"), 0.8f),
+			FUT3VehicleDamageRule(TEXT("UTDmg_ShockBeam_C"), 0.7f),
+			FUT3VehicleDamageRule(TEXT("UTDmg_ShockCore_C"), 0.8f),
+			FUT3VehicleDamageRule(TEXT("UTDmg_ShockCombo_C"), 0.8f),
+			FUT3VehicleDamageRule(TEXT("UTDMG_Link_Primary_C"), 0.6f),
+			FUT3VehicleDamageRule(TEXT("UTDMG_Link_Alt_C"), 0.8f),
+			FUT3VehicleDamageRule(TEXT("UTDMG_Link_AltPulse_C"), 0.8f),
+			FUT3VehicleDamageRule(TEXT("UTDMG_Minigun_Primary_C"), 0.6f),
+			FUT3VehicleDamageRule(TEXT("UTDMG_Minigun_Alt_C"), 0.6f),
+			FUT3VehicleDamageRule(TEXT("UTDMG_Minigun_Explosive_C"), 0.6f),
+			FUT3VehicleDamageRule(TEXT("UTDmg_FlakShard_C"), 0.8f),
+			FUT3VehicleDamageRule(TEXT("UTDmg_FlakShell_C"), 0.8f),
+			FUT3VehicleDamageRule(TEXT("UTDMG_Rocket_C"), 0.8f),
+			FUT3VehicleDamageRule(TEXT("UTDmg_Sniper_C"), 0.4f, true),
+			FUT3VehicleDamageRule(TEXT("UTDmg_150cal_C"), 0.4f, true),
+			FUT3VehicleDamageRule(TEXT("BP_UTDmg_SniperHeadshot_C"), 0.4f),
+			FUT3VehicleDamageRule(TEXT("UTDmg_SniperHeadshot"), 0.4f),
+			FUT3VehicleDamageRule(TEXT("UTDmg_Redeemer_C"), 1.5f),
+			FUT3VehicleDamageRule(TEXT("UTDmg_InstagibBeam_C"), 1.0f),
+
+			// Active UT4-only weapons use the nearest UT3 infantry role.
+			FUT3VehicleDamageRule(TEXT("UTDmg_GrenadeLauncher_C"), 0.8f),
+			FUT3VehicleDamageRule(TEXT("UTDmg_GrenadeLauncher_Sticky_C"), 0.8f),
+			FUT3VehicleDamageRule(TEXT("UTDmg_GrenadeLauncher_Big_C"), 0.8f),
+			FUT3VehicleDamageRule(TEXT("UTDmg_GrenadeLauncher_Small_C"), 0.8f),
+			FUT3VehicleDamageRule(TEXT("UTDMG_LightningBeam_C"), 0.4f, true),
+			FUT3VehicleDamageRule(TEXT("UTDMG_LightningProj_C"), 0.4f, true),
+			FUT3VehicleDamageRule(TEXT("UTDMG_LightningBeamChain_C"), 0.4f, true)
+		};
+
+		for (UClass* TestClass = DamageTypeClass; TestClass != nullptr; TestClass = TestClass->GetSuperClass())
+		{
+			for (const FUT3VehicleDamageRule& Rule : Rules)
+			{
+				if (TestClass->GetFName() == Rule.ClassName)
+				{
+					return Rule.bSniperPrimary && bLightArmor ? Rule.Scaling * 1.5f : Rule.Scaling;
+				}
+			}
+		}
+
+		return DefaultScaling;
+	}
+}
+
 UUTVehicleComponent::UUTVehicleComponent()
 {
 	SetIsReplicated(true);
@@ -23,6 +97,8 @@ UUTVehicleComponent::UUTVehicleComponent()
 
 	Health = 600;
 	HealthMax = 600;
+	bLightArmor = false;
+	DefaultVehicleDamageScaling = 1.0f;
 	TeamNum = 255;
 	bDead = false;
 	bEntryLocked = false;
@@ -728,19 +804,44 @@ bool UUTVehicleComponent::FindSafeExitLocation(AUTCharacter* Character, FVector&
 float UUTVehicleComponent::ApplyDamage(float Damage, const FDamageEvent& DamageEvent, AController* EventInstigator, AActor* DamageCauser)
 {
 	AActor* Owner = GetOwner();
-	if (Owner == nullptr || Owner->Role != ROLE_Authority || bDead || Damage <= 0.0f)
+	if (Owner == nullptr || Owner->Role != ROLE_Authority || bDead || !FMath::IsFinite(Damage) || Damage <= 0.0f)
 	{
 		return 0.0f;
 	}
 
-	Health -= FMath::TruncToInt(Damage);
+	const float ScaledDamage = CalculateVehicleDamage(Damage, DamageEvent);
+	const int32 AppliedDamage = FMath::Max(0, FMath::TruncToInt(ScaledDamage));
+	if (AppliedDamage == 0)
+	{
+		return 0.0f;
+	}
+
+	Health -= AppliedDamage;
 	if (Health <= 0)
 	{
 		Health = 0;
 		VehicleDied(EventInstigator);
 	}
 
-	return Damage;
+	UE_LOG(LogTemp, Verbose, TEXT("[VehicleDamage] Vehicle=%s Type=%s Raw=%.2f Scaled=%.2f Applied=%d Health=%d/%d"),
+		*GetNameSafe(Owner), *GetNameSafe(DamageEvent.DamageTypeClass.Get()), Damage, ScaledDamage, AppliedDamage, Health, HealthMax);
+
+	return static_cast<float>(AppliedDamage);
+}
+
+float UUTVehicleComponent::CalculateVehicleDamage(float Damage, const FDamageEvent& DamageEvent) const
+{
+	if (const UUTVehicleDamageType* VehicleDamageType = Cast<UUTVehicleDamageType>(DamageEvent.DamageTypeClass.GetDefaultObject()))
+	{
+		return VehicleDamageType->CalculateVehicleDamage(Damage, this);
+	}
+
+	const float SafeDefaultScaling = FMath::IsFinite(DefaultVehicleDamageScaling)
+		? FMath::Max(0.0f, DefaultVehicleDamageScaling)
+		: 1.0f;
+	const float Scaling = GetStockVehicleDamageScaling(DamageEvent.DamageTypeClass.Get(), bLightArmor, SafeDefaultScaling);
+	const float ScaledDamage = Damage * Scaling;
+	return FMath::IsFinite(ScaledDamage) ? FMath::Max(0.0f, ScaledDamage) : 0.0f;
 }
 
 void UUTVehicleComponent::VehicleDied(AController* Killer)

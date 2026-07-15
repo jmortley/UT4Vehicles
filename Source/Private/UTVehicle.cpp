@@ -718,7 +718,19 @@ float AUTVehicle::TakeDamage(float Damage, const FDamageEvent& DamageEvent, ACon
 {
 	if (VehicleComponent != nullptr)
 	{
-		return VehicleComponent->ApplyDamage(Damage, DamageEvent, EventInstigator, DamageCauser);
+		float ResolvedDamage = Damage;
+		if (DamageEvent.IsOfType(FRadialDamageEvent::ClassID))
+		{
+			ResolvedDamage = InternalTakeRadialDamage(Damage,
+				static_cast<const FRadialDamageEvent&>(DamageEvent), EventInstigator, DamageCauser);
+		}
+		else if (DamageEvent.IsOfType(FPointDamageEvent::ClassID))
+		{
+			ResolvedDamage = InternalTakePointDamage(Damage,
+				static_cast<const FPointDamageEvent&>(DamageEvent), EventInstigator, DamageCauser);
+		}
+
+		return VehicleComponent->ApplyDamage(ResolvedDamage, DamageEvent, EventInstigator, DamageCauser);
 	}
 	return 0.0f;
 }
