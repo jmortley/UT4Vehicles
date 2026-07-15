@@ -5,6 +5,7 @@
 
 UUTVehicleMeshComponent::UUTVehicleMeshComponent(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
+	, VisualWheelCenterOffsetZ(0.0f)
 	, bLoggedActiveWheelPose(false)
 {
 }
@@ -53,7 +54,21 @@ void UUTVehicleMeshComponent::RefreshBoneTransforms(FActorComponentTickFunction*
 			Wheel->GetSteerAngle(),
 			0.0f));
 		WheelTransform.SetRotation(WheelRotation * WheelTransform.GetRotation());
-		WheelTransform.AddToTranslation(FVector(0.0f, 0.0f, Wheel->GetSuspensionOffset()));
+
+		// AdditionalOffset moves the PhysX wheel away from its skeletal bone, but
+		// the stock vehicle animation only applies suspension jounce to the bone.
+		// The Scorpion needs a large mesh-specific AdditionalOffset, so that path
+		// leaves the rendered tire at a different height from the wheel that is
+		// actually supporting the chassis. Drive the visual suspension axis from
+		// PhysX's wheel-shape center instead. Keep the authored X/Y so steering and
+		// the UT3 tire spacing remain unchanged.
+		FVector VisualLocation = WheelTransform.GetTranslation();
+		const FVector PhysicsLocation = GetComponentTransform().InverseTransformPosition(Wheel->Location);
+		// The imported UT3 render tire is slightly larger than its PhysX wheel
+		// shape. A mesh-specific center lift keeps the visible rubber on the floor
+		// without changing gearing, suspension load, or contact physics.
+		VisualLocation.Z = PhysicsLocation.Z + VisualWheelCenterOffsetZ;
+		WheelTransform.SetTranslation(VisualLocation);
 		WheelTransform.NormalizeRotation();
 		++AppliedWheels;
 	}
@@ -67,8 +82,8 @@ void UUTVehicleMeshComponent::RefreshBoneTransforms(FActorComponentTickFunction*
 		if (!bLoggedActiveWheelPose)
 		{
 			bLoggedActiveWheelPose = true;
-			UE_LOG(LogTemp, Warning, TEXT("[VehicleAnimation] Native wheel pose active Mesh=%s Wheels=%d"),
-				*GetName(), AppliedWheels);
+			UE_LOG(LogTemp, Warning, TEXT("[VehicleAnimation] Native wheel pose active Mesh=%s Wheels=%d VisualLiftZ=%.1f"),
+				*GetName(), AppliedWheels, VisualWheelCenterOffsetZ);
 		}
 	}
 }

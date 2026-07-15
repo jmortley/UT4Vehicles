@@ -28,11 +28,17 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Vehicle)
 	bool bSpawnOnBeginPlay;
 
+	/** Offset from the pad transform used for the spawned vehicle. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Vehicle)
+	FVector SpawnOffset;
+
 	/** The currently spawned vehicle */
-	UPROPERTY(BlueprintReadOnly, Category = Vehicle)
+	UPROPERTY(BlueprintReadOnly, Replicated, Category = Vehicle)
 	APawn* SpawnedVehicle;
 
 	virtual void BeginPlay() override;
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
 
 	/** Spawn a new vehicle at this location */
 	UFUNCTION(BlueprintCallable, Category = Vehicle)

@@ -2,6 +2,7 @@
 #include "UnrealTournament.h"
 #include "WheeledVehicleMovementComponent4W.h"
 #include "UTVehicleComponent.h"
+#include "UTVehicleMeshComponent.h"
 #include "PhysicsEngine/BodySetup.h"
 #include "TireConfig.h"
 #include "Sound/SoundBase.h"
@@ -13,6 +14,14 @@ namespace
 {
 	void ConfigureScorpionDriveFromWorkingBP(UWheeledVehicleMovementComponent4W* Movement4W, USkeletalMeshComponent* Mesh)
 	{
+		if (UUTVehicleMeshComponent* VehicleMesh = Cast<UUTVehicleMeshComponent>(Mesh))
+		{
+			// The imported tire is about 65 uu from hub to tread while the PhysX
+			// wheel shape is 45 uu. Match the visible hub to the physical contact
+			// patch without changing suspension, gearing, or traction.
+			VehicleMesh->VisualWheelCenterOffsetZ = 20.0f;
+		}
+
 		// The supplied folder has no runnable Scorpion BP. Copy the powertrain
 		// defaults from working BP_GoliathTest_1, but keep wheel placement tied
 		// to the Scorpion mesh's own tire bones.
@@ -45,15 +54,17 @@ namespace
 		// and the tires with no usable load. At 9 Hz, PhysX's static equilibrium is
 		// gravity / frequency^2 = about +12 cm jounce. Lower the rest positions by
 		// the measured delta so the suspension, rather than the chassis, supports
-		// the vehicle. This produces about -134 front / -118 rear offsets.
+		// the vehicle. The first correction left the rear rest point 8 uu above the
+		// front and produced a visible tail-down stance even though all four PhysX
+		// wheel centers touched the floor correctly. Use one axle-center height so
+		// the rear chassis comes up without changing radius or visual tire lift.
 		if (Mesh != nullptr && Mesh->SkeletalMesh != nullptr)
 		{
 			const FVector MeshScale = Mesh->GetRelativeTransform().GetScale3D();
 			for (FWheelSetup& WheelSetup : Movement4W->WheelSetups)
 			{
 				const FVector BonePosition = Mesh->SkeletalMesh->GetComposedRefPoseMatrix(WheelSetup.BoneName).GetOrigin() * MeshScale;
-				const bool bFrontWheel = WheelSetup.BoneName == FName(TEXT("F_L_Tire")) || WheelSetup.BoneName == FName(TEXT("F_R_Tire"));
-				const float TargetRestHeight = bFrontWheel ? -24.5f : -16.5f;
+				const float TargetRestHeight = -24.5f;
 				WheelSetup.AdditionalOffset.Z = TargetRestHeight - BonePosition.Z;
 			}
 		}

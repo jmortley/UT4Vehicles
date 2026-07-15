@@ -68,6 +68,9 @@ public:
 	virtual void SetupPlayerInputComponent(UInputComponent* PlayerInputComponent) override;
 	virtual float TakeDamage(float Damage, const FDamageEvent& DamageEvent, AController* EventInstigator, AActor* DamageCauser) override;
 	virtual void PawnClientRestart() override;
+	virtual void PawnStartFire(uint8 FireModeNum = 0) override;
+	/** Explicit stop dispatcher for AI and other non-player vehicle controllers. */
+	void StopVehicleFire(uint8 FireModeNum = 0);
 
 	// AActor
 	virtual void PostRender(class AUTHUD* HUD, UCanvas* Canvas);
@@ -85,14 +88,15 @@ public:
 	void OnReverseInput(float Value);
 	void OnSteeringInput(float Value);
 	void OnSteerLeftInput(float Value);
-	void OnHandbrakePressed();
-	void OnHandbrakeReleased();
+	virtual void OnHandbrakePressed();
+	virtual void OnHandbrakeReleased();
+	virtual void OnPrimaryFirePressed();
+	virtual void OnPrimaryFireReleased();
+	virtual void OnAltFirePressed();
+	virtual void OnAltFireReleased();
+	void OnHornPressed();
 	void PlayEnterSound();
 	void PlayExitSound();
-
-	/** Server RPC: request to enter this vehicle */
-	UFUNCTION(Reliable, Server, WithValidation)
-	void ServerTryEnter(APawn* NewDriver);
 
 	/** Server RPC: request to exit this vehicle */
 	UFUNCTION(Reliable, Server, WithValidation)
@@ -115,6 +119,14 @@ protected:
 	// explicitly pushed above the possessing controller's component.
 	void BindDrivingInput();
 	void UnbindDrivingInput();
+	virtual void BindVehicleSpecificInput(UInputComponent* InputComponent);
+	virtual bool HandleDriverLeaveRequest();
+	void HandleHandbrakePressed();
+	void HandleHandbrakeReleased();
+	void HandlePrimaryFirePressed();
+	void HandlePrimaryFireReleased();
+	void HandleAltFirePressed();
+	void HandleAltFireReleased();
 	void ActivateVehicleCamera();
 	void DeactivateVehicleCamera();
 	void UpdateVehicleAudio(float DeltaSeconds);
@@ -143,6 +155,11 @@ protected:
 	float ReverseAxisValue;
 	float SteerRightAxisValue;
 	float SteerLeftAxisValue;
+	bool bHandbrakeInputDown;
+	bool bPrimaryFireKeyDown;
+	bool bAltFireKeyDown;
+	bool bPrimaryFireInputDown;
+	bool bAltFireInputDown;
 	float NextDriveInputLogTime;
 	float LastImpactSoundTime;
 };

@@ -1,10 +1,15 @@
 #include "UTVehicleComponent.h"
 #include "UTVehicle.h"
-#include "UTVehicleFlying.h"
+#include "UTVehicleEntryProxy.h"
 #include "UnrealTournament.h"
 #include "UnrealNetwork.h"
+#include "Components/CapsuleComponent.h"
 #include "Components/InputComponent.h"
+#include "Kismet/GameplayStatics.h"
+#include "Sound/SoundAttenuation.h"
+#include "Sound/SoundBase.h"
 #include "UTCharacter.h"
+#include "UTWeapon.h"
 #include "UTPlayerController.h"
 #include "UTPlayerState.h"
 #include "UTGameState.h"
@@ -13,11 +18,14 @@
 UUTVehicleComponent::UUTVehicleComponent()
 {
 	SetIsReplicated(true);
+	PrimaryComponentTick.bCanEverTick = true;
+	PrimaryComponentTick.bStartWithTickEnabled = false;
 
 	Health = 600;
 	HealthMax = 600;
 	TeamNum = 255;
 	bDead = false;
+	bEntryLocked = false;
 	EntryRadius = 300.0f;
 	RespawnDelay = 15.0f;
 	Driver = nullptr;
@@ -28,6 +36,18 @@ UUTVehicleComponent::UUTVehicleComponent()
 	EntryInputPawn = nullptr;
 	VisualDriver = nullptr;
 	SavedMaxSafeFallSpeed = 2400.0f;
+	HornAttenuation = nullptr;
+	LastHornTime = -1000.0f;
+
+	// UT3 exposes shared Axon/Necris horn banks rather than a Raptor-specific
+	// recording. Scorpion and Raptor are both small Axon vehicles, so they use
+	// the original SmallHuman horn. Future heavy/Necris classes can override the
+	// component default in their constructor or Blueprint defaults.
+	static ConstructorHelpers::FObjectFinder<USoundBase> HornFinder(
+		TEXT("/Game/Mogno/Vehicles/Common/SFX/Vehicle_Horn_SmallHuman01"));
+	static ConstructorHelpers::FObjectFinder<USoundBase> StockHornFallback(
+		TEXT("/Game/RestrictedAssets/Audio/Accessories/TrainHorn03"));
+	HornSound = HornFinder.Succeeded() ? HornFinder.Object : StockHornFallback.Object;
 }
 
 void UUTVehicleComponent::SetDriverVisualState(APawn* DriverPawn, bool bDriving)
@@ -38,7 +58,14 @@ void UUTVehicleComponent::SetDriverVisualState(APawn* DriverPawn, bool bDriving)
 		return;
 	}
 
-	UTChar->SetActorHiddenInGame(bDriving);
+	// UT's helper also hides the third-person weapon attachment, hat, and
+	// eyewear. SetActorHiddenInGame() alone leaves the detached weapon visual at
+	// the old character location, which looks like the player dropped the gun.
+	UTChar->HideCharacter(bDriving);
+	if (AUTWeapon* HeldWeapon = UTChar->GetWeapon())
+	{
+		HeldWeapon->SetActorHiddenInGame(bDriving);
+	}
 	UTChar->SetActorEnableCollision(!bDriving);
 	if (UTChar->GetCharacterMovement() != nullptr)
 	{
@@ -63,18 +90,104 @@ void UUTVehicleComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& 
 	DOREPLIFETIME(UUTVehicleComponent, HealthMax);
 	DOREPLIFETIME(UUTVehicleComponent, TeamNum);
 	DOREPLIFETIME(UUTVehicleComponent, bDead);
+	DOREPLIFETIME(UUTVehicleComponent, bEntryLocked);
 }
 
 void UUTVehicleComponent::BeginPlay()
 {
 	Super::BeginPlay();
+
+	HornAttenuation = NewObject<USoundAttenuation>(this, TEXT("VehicleHornAttenuationRuntime"));
+	if (HornAttenuation != nullptr)
+	{
+		FAttenuationSettings& Settings = HornAttenuation->Attenuation;
+		Settings.bAttenuate = true;
+		Settings.bSpatialize = true;
+		Settings.DistanceAlgorithm = ATTENUATION_Linear;
+		Settings.AttenuationShape = EAttenuationShape::Sphere;
+		Settings.AttenuationShapeExtents = FVector(600.0f, 0.0f, 0.0f);
+		Settings.FalloffDistance = 6000.0f;
+		Settings.OmniRadius = 150.0f;
+	}
 	InitEntryTrigger();
+}
+
+void UUTVehicleComponent::RequestHorn()
+{
+	AActor* Owner = GetOwner();
+	if (Owner == nullptr)
+	{
+		return;
+	}
+
+	if (Owner->Role == ROLE_Authority)
+	{
+		PlayHornAuthoritative();
+	}
+	else
+	{
+		ServerRequestHorn();
+	}
+}
+
+bool UUTVehicleComponent::ServerRequestHorn_Validate()
+{
+	return GetOwner() != nullptr && Driver != nullptr && !bDead;
+}
+
+void UUTVehicleComponent::ServerRequestHorn_Implementation()
+{
+	PlayHornAuthoritative();
+}
+
+void UUTVehicleComponent::PlayHornAuthoritative()
+{
+	AActor* Owner = GetOwner();
+	UWorld* World = GetWorld();
+	if (Owner == nullptr || World == nullptr || Driver == nullptr || bDead)
+	{
+		return;
+	}
+
+	// Cap repeat rate so a held/macroed key cannot flood a match with reliable
+	// multicast traffic. UT3 horns are short one-shots, not looping components.
+	const float Now = World->GetTimeSeconds();
+	if (Now - LastHornTime < 0.25f)
+	{
+		return;
+	}
+	LastHornTime = Now;
+	MulticastPlayHorn();
+}
+
+void UUTVehicleComponent::MulticastPlayHorn_Implementation()
+{
+	AActor* Owner = GetOwner();
+	if (Owner != nullptr && HornSound != nullptr)
+	{
+		UGameplayStatics::PlaySoundAtLocation(Owner, HornSound, Owner->GetActorLocation(),
+			1.0f, 1.0f, 0.0f, HornAttenuation);
+	}
 }
 
 void UUTVehicleComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
 	UnbindEntryInput();
 	Super::EndPlay(EndPlayReason);
+}
+
+void UUTVehicleComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
+{
+	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
+	if (EntryInputComponent != nullptr &&
+		(EntryInputPC == nullptr || EntryInputPawn == nullptr ||
+		 EntryInputPC->GetPawn() != EntryInputPawn || !CanEnterVehicle(EntryInputPawn)))
+	{
+		// Possession can change without producing an overlap-end callback for the
+		// now-hidden character. Remove stale entry captures before they can consume
+		// ActivateSpecial and block the possessed vehicle's exit binding.
+		UnbindEntryInput();
+	}
 }
 
 void UUTVehicleComponent::InitEntryTrigger()
@@ -113,15 +226,14 @@ void UUTVehicleComponent::OnEntryTriggerBeginOverlap(UPrimitiveComponent* Overla
 	OverlappingPawns.AddUnique(OtherPawn);
 
 	AActor* Owner = GetOwner();
-	if (Owner != nullptr && Owner->Role == ROLE_Authority && Driver == nullptr)
+	if (Owner != nullptr && Owner->Role == ROLE_Authority)
 	{
-		// Server RPCs on an empty world vehicle are legal only after it is owned by
-		// the overlapping player's connection. TryToDrive still validates range,
-		// team and vacancy on the server when ActivateSpecial is pressed.
-		RefreshEntryOwner();
+		// Empty vehicles remain unowned. Give each overlapping player one owned,
+		// replicated RPC bridge instead of racing vehicle ownership between them.
+		EnsureEntryProxy(OtherPawn->Controller);
 	}
 
-	if (OtherPawn->IsLocallyControlled())
+	if (OtherPawn->IsLocallyControlled() && CanEnterVehicle(OtherPawn))
 	{
 		BindEntryInput(OtherPawn);
 	}
@@ -136,10 +248,6 @@ void UUTVehicleComponent::OnEntryTriggerEndOverlap(UPrimitiveComponent* Overlapp
 		if (OtherPawn == EntryInputPawn)
 		{
 			UnbindEntryInput();
-		}
-		if (GetOwner() != nullptr && GetOwner()->Role == ROLE_Authority && Driver == nullptr)
-		{
-			RefreshEntryOwner();
 		}
 	}
 }
@@ -168,13 +276,19 @@ void UUTVehicleComponent::BindEntryInput(APawn* LocalPawn)
 	EntryInputComponent = NewObject<UInputComponent>(PC);
 	if (EntryInputComponent != nullptr)
 	{
-		EntryInputComponent->Priority = 90;
+		// Stock UT binds ActivateSpecial on the player controller and other game
+		// features may push their own capture components. Vehicle use must get the
+		// first look at the key while the local pawn is inside the entry trigger.
+		EntryInputComponent->Priority = 10000;
 		EntryInputComponent->bBlockInput = false;
 		FInputActionBinding& EntryBinding = EntryInputComponent->BindAction(
 			TEXT("ActivateSpecial"), IE_Pressed, this, &UUTVehicleComponent::OnActivateSpecialPressed);
 		EntryBinding.bConsumeInput = true;
 		EntryInputComponent->RegisterComponent();
 		PC->PushInputComponent(EntryInputComponent);
+		UE_LOG(LogTemp, Warning, TEXT("[VehicleEntry] ActivateSpecial bound PC=%s Pawn=%s Priority=%d"),
+			*GetNameSafe(PC), *GetNameSafe(LocalPawn), EntryInputComponent->Priority);
+		SetComponentTickEnabled(true);
 	}
 
 	if (PC->MyHUD != nullptr && GetOwner() != nullptr)
@@ -201,6 +315,7 @@ void UUTVehicleComponent::UnbindEntryInput()
 	EntryInputComponent = nullptr;
 	EntryInputPC = nullptr;
 	EntryInputPawn = nullptr;
+	SetComponentTickEnabled(false);
 }
 
 void UUTVehicleComponent::OnActivateSpecialPressed()
@@ -210,7 +325,14 @@ void UUTVehicleComponent::OnActivateSpecialPressed()
 	{
 		Candidate = EntryInputPC->GetPawn();
 	}
-	if (Candidate == nullptr || Driver != nullptr || bDead || !IsInEntryRange(Candidate))
+	const bool bCandidateInRange = Candidate != nullptr && IsInEntryRange(Candidate);
+	const bool bCanEnter = CanEnterVehicle(Candidate);
+	UE_LOG(LogTemp, Warning, TEXT("[VehicleEntry] ActivateSpecial pressed Vehicle=%s Owner=%s Candidate=%s InRange=%d CanEnter=%d Driver=%s Dead=%d Locked=%d Role=%d"),
+		*GetNameSafe(GetOwner()), *GetNameSafe(GetOwner() != nullptr ? GetOwner()->GetOwner() : nullptr),
+		*GetNameSafe(Candidate), bCandidateInRange ? 1 : 0, bCanEnter ? 1 : 0,
+		*GetNameSafe(Driver), bDead ? 1 : 0, bEntryLocked ? 1 : 0,
+		GetOwner() != nullptr ? (int32)GetOwner()->Role : -1);
+	if (!bCanEnter)
 	{
 		return;
 	}
@@ -224,39 +346,42 @@ void UUTVehicleComponent::OnActivateSpecialPressed()
 	{
 		TryToDrive(Candidate);
 	}
-	else if (AUTVehicle* WheeledVehicle = Cast<AUTVehicle>(VehicleActor))
+	else
 	{
-		WheeledVehicle->ServerTryEnter(Candidate);
-	}
-	else if (AUTVehicleFlying* FlyingVehicle = Cast<AUTVehicleFlying>(VehicleActor))
-	{
-		FlyingVehicle->ServerTryEnter(Candidate);
+		AUTVehicleEntryProxy* EntryProxy = AUTVehicleEntryProxy::FindForController(GetWorld(), EntryInputPC);
+		if (EntryProxy != nullptr)
+		{
+			EntryProxy->ServerTryEnterVehicle(VehicleActor);
+		}
+		else
+		{
+			UE_LOG(LogTemp, Warning, TEXT("[VehicleEntry] No owned entry proxy yet for PC=%s"),
+				*GetNameSafe(EntryInputPC));
+		}
 	}
 }
 
-void UUTVehicleComponent::RefreshEntryOwner()
+void UUTVehicleComponent::EnsureEntryProxy(AController* Controller)
 {
 	AActor* Vehicle = GetOwner();
-	if (Vehicle == nullptr || Vehicle->Role != ROLE_Authority)
+	APlayerController* PC = Cast<APlayerController>(Controller);
+	UWorld* World = GetWorld();
+	if (Vehicle == nullptr || Vehicle->Role != ROLE_Authority || PC == nullptr || World == nullptr)
 	{
 		return;
 	}
 
-	AController* DesiredOwner = Driver != nullptr ? Driver->Controller : nullptr;
-	if (DesiredOwner == nullptr)
+	if (AUTVehicleEntryProxy::FindForController(World, PC) == nullptr)
 	{
-		for (APawn* Candidate : OverlappingPawns)
-		{
-			if (Candidate != nullptr && Candidate->Controller != nullptr)
-			{
-				DesiredOwner = Candidate->Controller;
-				break;
-			}
-		}
-	}
-	if (Vehicle->GetOwner() != DesiredOwner)
-	{
-		Vehicle->SetOwner(DesiredOwner);
+		FActorSpawnParameters SpawnParameters;
+		SpawnParameters.Owner = PC;
+		SpawnParameters.Instigator = PC->GetPawn();
+		SpawnParameters.ObjectFlags |= RF_Transient;
+		SpawnParameters.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+		AUTVehicleEntryProxy* Proxy = World->SpawnActor<AUTVehicleEntryProxy>(
+			AUTVehicleEntryProxy::StaticClass(), FVector::ZeroVector, FRotator::ZeroRotator, SpawnParameters);
+		UE_LOG(LogTemp, Warning, TEXT("[VehicleEntry] Entry proxy spawned PC=%s Proxy=%s"),
+			*GetNameSafe(PC), *GetNameSafe(Proxy));
 	}
 }
 
@@ -267,7 +392,18 @@ bool UUTVehicleComponent::TryToDrive(APawn* NewDriver)
 	{
 		return false;
 	}
-	if (bDead || NewDriver == nullptr || Driver != nullptr)
+	if (!CanEnterVehicle(NewDriver))
+	{
+		return false;
+	}
+
+	return DriverEnter(NewDriver);
+}
+
+bool UUTVehicleComponent::CanEnterVehicle(APawn* NewDriver) const
+{
+	AUTCharacter* UTChar = Cast<AUTCharacter>(NewDriver);
+	if (bDead || bEntryLocked || NewDriver == nullptr || NewDriver->Controller == nullptr || UTChar == nullptr || Driver != nullptr)
 	{
 		return false;
 	}
@@ -277,8 +413,7 @@ bool UUTVehicleComponent::TryToDrive(APawn* NewDriver)
 	}
 
 	// Team check
-	AUTCharacter* UTChar = Cast<AUTCharacter>(NewDriver);
-	if (UTChar != nullptr && TeamNum != 255)
+	if (TeamNum != 255)
 	{
 		AUTPlayerState* PS = Cast<AUTPlayerState>(UTChar->PlayerState);
 		if (PS != nullptr && PS->GetTeamNum() != TeamNum)
@@ -287,7 +422,20 @@ bool UUTVehicleComponent::TryToDrive(APawn* NewDriver)
 		}
 	}
 
-	return DriverEnter(NewDriver);
+	return true;
+}
+
+void UUTVehicleComponent::SetEntryLocked(bool bLocked)
+{
+	AActor* Owner = GetOwner();
+	if (Owner == nullptr || Owner->Role != ROLE_Authority || bEntryLocked == bLocked)
+	{
+		return;
+	}
+
+	bEntryLocked = bLocked;
+	RefreshEntryInput();
+	Owner->ForceNetUpdate();
 }
 
 bool UUTVehicleComponent::DriverEnter(APawn* NewDriver)
@@ -298,60 +446,59 @@ bool UUTVehicleComponent::DriverEnter(APawn* NewDriver)
 	{
 		return false;
 	}
-	if (Driver != nullptr)
+	if (!CanEnterVehicle(NewDriver))
 	{
-		DriverLeave(true);
+		return false;
 	}
-	if (NewDriver == nullptr)
+
+	AController* C = NewDriver->Controller;
+	if (C == nullptr)
 	{
 		return false;
 	}
 
 	Driver = NewDriver;
-	AController* C = NewDriver->Controller;
-	if (C != nullptr)
+	UnbindEntryInput();
+	DamageInstigator = C;
+	Owner->SetOwner(C);
+
+	AUTCharacter* UTChar = Cast<AUTCharacter>(NewDriver);
+	if (UTChar != nullptr)
 	{
-		DamageInstigator = C;
-		Owner->SetOwner(C);
+		UE_LOG(LogTemp, Warning, TEXT("[Vehicle] DriverEnter: Health=%d IsDead=%d before entry"), UTChar->Health, UTChar->IsDead() ? 1 : 0);
+		SavedMaxSafeFallSpeed = UTChar->MaxSafeFallSpeed;
+	}
 
-		AUTCharacter* UTChar = Cast<AUTCharacter>(NewDriver);
-		if (UTChar != nullptr)
-		{
-			UE_LOG(LogTemp, Warning, TEXT("[Vehicle] DriverEnter: Health=%d IsDead=%d before entry"), UTChar->Health, UTChar->IsDead() ? 1 : 0);
-			SavedMaxSafeFallSpeed = UTChar->MaxSafeFallSpeed;
-		}
+	// OnRep_Driver does not execute for the authority copy. Apply this
+	// immediately so a listen host's old character does not remain visible,
+	// collide with the vehicle, or get pushed into the air.
+	SetDriverVisualState(NewDriver, true);
+	VisualDriver = NewDriver;
 
-		// OnRep_Driver does not execute for the authority copy. Apply this
-		// immediately so a listen host's old character does not remain visible,
-		// collide with the vehicle, or get pushed into the air.
-		SetDriverVisualState(NewDriver, true);
-		VisualDriver = NewDriver;
+	// Redeemer pattern
+	C->UnPossess();
 
-		// Redeemer pattern
-		C->UnPossess();
+	if (UTChar != nullptr)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[Vehicle] After UnPossess: Health=%d IsDead=%d"), UTChar->Health, UTChar->IsDead() ? 1 : 0);
+	}
 
-		if (UTChar != nullptr)
-		{
-			UE_LOG(LogTemp, Warning, TEXT("[Vehicle] After UnPossess: Health=%d IsDead=%d"), UTChar->Health, UTChar->IsDead() ? 1 : 0);
-		}
+	NewDriver->SetOwner(Owner);
+	C->Possess(VehiclePawn);
 
-		NewDriver->SetOwner(Owner);
-		C->Possess(VehiclePawn);
+	UE_LOG(LogTemp, Warning, TEXT("[Vehicle] After Possess: Vehicle.Controller=%s, Role=%d"), VehiclePawn->Controller ? *VehiclePawn->Controller->GetName() : TEXT("NONE"), (int32)VehiclePawn->Role);
 
-		UE_LOG(LogTemp, Warning, TEXT("[Vehicle] After Possess: Vehicle.Controller=%s, Role=%d"), VehiclePawn->Controller ? *VehiclePawn->Controller->GetName() : TEXT("NONE"), (int32)VehiclePawn->Role);
+	if (UTChar != nullptr)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[Vehicle] After Possess vehicle: Health=%d IsDead=%d"), UTChar->Health, UTChar->IsDead() ? 1 : 0);
+		UTChar->StartDriving(VehiclePawn);
+		VehiclePawn->PlayerState = UTChar->PlayerState;
+	}
 
-		if (UTChar != nullptr)
-		{
-			UE_LOG(LogTemp, Warning, TEXT("[Vehicle] After Possess vehicle: Health=%d IsDead=%d"), UTChar->Health, UTChar->IsDead() ? 1 : 0);
-			UTChar->StartDriving(VehiclePawn);
-			VehiclePawn->PlayerState = UTChar->PlayerState;
-		}
-
-		AUTVehicle* Vehicle = Cast<AUTVehicle>(VehiclePawn);
-		if (Vehicle != nullptr)
-		{
-			Vehicle->PlayEnterSound();
-		}
+	AUTVehicle* Vehicle = Cast<AUTVehicle>(VehiclePawn);
+	if (Vehicle != nullptr)
+	{
+		Vehicle->PlayEnterSound();
 	}
 
 	return true;
@@ -359,77 +506,229 @@ bool UUTVehicleComponent::DriverEnter(APawn* NewDriver)
 
 bool UUTVehicleComponent::DriverLeave(bool bForceLeave)
 {
+	return DriverLeaveInternal(bForceLeave, false, FVector::ZeroVector, false);
+}
+
+bool UUTVehicleComponent::EjectDriver(const FVector& EjectVelocity, bool bInheritVehicleVelocity)
+{
+	return DriverLeaveInternal(true, true, EjectVelocity, bInheritVehicleVelocity);
+}
+
+bool UUTVehicleComponent::DriverLeaveInternal(bool bForceLeave, bool bEject,
+	const FVector& EjectVelocity, bool bInheritVehicleVelocity)
+{
 	AActor* Owner = GetOwner();
 	APawn* VehiclePawn = Cast<APawn>(Owner);
-	if (Owner == nullptr || VehiclePawn == nullptr)
+	if (Owner == nullptr || Owner->Role != ROLE_Authority || VehiclePawn == nullptr)
 	{
 		return false;
 	}
 
+	APawn* OldDriver = Driver;
 	AController* C = VehiclePawn->Controller;
-	if (Driver != nullptr && C != nullptr)
+	if (OldDriver == nullptr || C == nullptr)
 	{
-		AUTVehicle* Vehicle = Cast<AUTVehicle>(VehiclePawn);
-		if (Vehicle != nullptr)
-		{
-			Vehicle->PlayExitSound();
-		}
+		// Never clear Driver without a controller available to restore possession;
+		// doing so strands a hidden, collision-disabled character on disconnect.
+		return false;
+	}
 
-		// Handle spectators viewing this vehicle
-		AUTGameState* GS = GetWorld()->GetGameState<AUTGameState>();
-		if (C->PlayerState != nullptr && GS != nullptr && !GS->IsMatchIntermission() && !GS->HasMatchEnded())
+	AUTCharacter* UTChar = Cast<AUTCharacter>(OldDriver);
+	FVector ExitLocation = FVector::ZeroVector;
+	FRotator ExitRotation(0.0f, Owner->GetActorRotation().Yaw, 0.0f);
+	bool bHasExitLocation = false;
+
+	if (bEject && UTChar != nullptr)
+	{
+		FVector BoundsOrigin = Owner->GetActorLocation();
+		FVector BoundsExtent = FVector::ZeroVector;
+		UPrimitiveComponent* RootPrimitive = Cast<UPrimitiveComponent>(Owner->GetRootComponent());
+		if (RootPrimitive != nullptr)
 		{
-			for (FLocalPlayerIterator It(GEngine, GetWorld()); It; ++It)
+			BoundsOrigin = RootPrimitive->Bounds.Origin;
+			BoundsExtent = RootPrimitive->Bounds.BoxExtent;
+		}
+		else
+		{
+			Owner->GetActorBounds(true, BoundsOrigin, BoundsExtent);
+		}
+		const float CapsuleHalfHeight = UTChar->GetCapsuleComponent() != nullptr
+			? UTChar->GetCapsuleComponent()->GetScaledCapsuleHalfHeight()
+			: 96.0f;
+		const FVector RequestedLocation = BoundsOrigin +
+			FVector::UpVector * (BoundsExtent.Z + CapsuleHalfHeight + 50.0f);
+		ExitLocation = RequestedLocation;
+		if (GetWorld() != nullptr)
+		{
+			FVector AdjustedLocation = RequestedLocation;
+			if (GetWorld()->FindTeleportSpot(UTChar, AdjustedLocation, ExitRotation))
 			{
-				AUTPlayerController* UTPC = Cast<AUTPlayerController>(It->PlayerController);
-				if (UTPC != nullptr && UTPC->LastSpectatedPlayerState == C->PlayerState)
-				{
-					UTPC->ViewPawn(Driver);
-				}
+				ExitLocation = AdjustedLocation;
 			}
 		}
+		bHasExitLocation = true;
+	}
+	else if (UTChar != nullptr)
+	{
+		bHasExitLocation = FindSafeExitLocation(UTChar, ExitLocation, ExitRotation);
+	}
 
-		// Transfer possession back: vehicle -> character
-		C->UnPossess();
-		Driver->SetOwner(C);
+	if (!bHasExitLocation && !bForceLeave)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[VehicleExit] No supported, collision-free exit for Vehicle=%s Driver=%s; staying in vehicle"),
+			*GetNameSafe(Owner), *GetNameSafe(OldDriver));
+		return false;
+	}
+	if (!bHasExitLocation && UTChar != nullptr)
+	{
+		// A destroyed vehicle must release its driver even when airborne. Put the
+		// forced exit above the chassis; manual exits never use this fallback.
+		FVector BoundsOrigin;
+		FVector BoundsExtent;
+		Owner->GetActorBounds(true, BoundsOrigin, BoundsExtent);
+		const float CapsuleHalfHeight = UTChar->GetCapsuleComponent() != nullptr
+			? UTChar->GetCapsuleComponent()->GetScaledCapsuleHalfHeight()
+			: 96.0f;
+		ExitLocation = BoundsOrigin + FVector::UpVector * (BoundsExtent.Z + CapsuleHalfHeight + 50.0f);
+		bHasExitLocation = true;
+	}
 
-		AUTCharacter* UTChar = Cast<AUTCharacter>(Driver);
-		if (UTChar != nullptr)
+	AUTVehicle* Vehicle = Cast<AUTVehicle>(VehiclePawn);
+	if (Vehicle != nullptr)
+	{
+		Vehicle->PlayExitSound();
+	}
+
+	// Handle spectators viewing this vehicle
+	UWorld* World = GetWorld();
+	AUTGameState* GS = World != nullptr ? World->GetGameState<AUTGameState>() : nullptr;
+	if (World != nullptr && C->PlayerState != nullptr && GS != nullptr &&
+		!GS->IsMatchIntermission() && !GS->HasMatchEnded())
+	{
+		for (FLocalPlayerIterator It(GEngine, World); It; ++It)
 		{
-			UTChar->StopDriving(VehiclePawn);
-
-			// Place driver behind the vehicle BEFORE re-enabling collision
-			FVector ExitLocation = Owner->GetActorLocation() + Owner->GetActorForwardVector() * -200.0f + FVector(0.0f, 0.0f, 100.0f);
-			UTChar->TeleportTo(ExitLocation, Owner->GetActorRotation(), false, true);
-
-			// Restore fall damage threshold and re-enable movement
-			UTChar->MaxSafeFallSpeed = SavedMaxSafeFallSpeed;
-			if (UTChar->GetCharacterMovement() != nullptr)
+			AUTPlayerController* UTPC = Cast<AUTPlayerController>(It->PlayerController);
+			if (UTPC != nullptr && UTPC->LastSpectatedPlayerState == C->PlayerState)
 			{
-				UTChar->GetCharacterMovement()->Velocity = FVector::ZeroVector;
-				UTChar->GetCharacterMovement()->SetMovementMode(MOVE_Walking);
-			}
-			SetDriverVisualState(UTChar, false);
-
-			if (UTChar->GetWeapon() != nullptr)
-			{
-				UTChar->GetWeapon()->AddAmmo(0);
+				UTPC->ViewPawn(OldDriver);
 			}
 		}
+	}
 
-		C->Possess(Driver);
-		VehiclePawn->PlayerState = nullptr;
+	// Transfer possession back: vehicle -> character
+	C->UnPossess();
+	OldDriver->SetOwner(C);
+
+	if (UTChar != nullptr)
+	{
+		UTChar->StopDriving(VehiclePawn);
+
+		// The location was checked while the hidden driver still belonged to the
+		// vehicle. Move there before restoring collision and character visuals.
+		UTChar->TeleportTo(ExitLocation, ExitRotation, false, true);
+
+		UTChar->MaxSafeFallSpeed = SavedMaxSafeFallSpeed;
+		SetDriverVisualState(UTChar, false);
+
+		if (UTChar->GetWeapon() != nullptr)
+		{
+			UTChar->GetWeapon()->AddAmmo(0);
+		}
+	}
+
+	C->Possess(OldDriver);
+	VehiclePawn->PlayerState = nullptr;
+
+	if (UTChar != nullptr && UTChar->GetCharacterMovement() != nullptr)
+	{
+		if (bEject)
+		{
+			FVector LaunchVelocity = EjectVelocity;
+			if (bInheritVehicleVelocity)
+			{
+				const FVector VehicleVelocity = Owner->GetVelocity();
+				LaunchVelocity.X += VehicleVelocity.X;
+				LaunchVelocity.Y += VehicleVelocity.Y;
+			}
+			UTChar->LaunchCharacter(LaunchVelocity, true, true);
+		}
+		else
+		{
+			UTChar->GetCharacterMovement()->Velocity = FVector::ZeroVector;
+			UTChar->GetCharacterMovement()->SetMovementMode(MOVE_Walking);
+		}
 	}
 
 	VisualDriver = nullptr;
 	Driver = nullptr;
-	RefreshEntryOwner();
+	if (Owner->Role == ROLE_Authority)
+	{
+		// Occupied vehicles are owned by their driver so exit RPCs are legal.
+		// Empty vehicles are never reassigned to an arbitrary overlapper.
+		Owner->SetOwner(nullptr);
+	}
 	return true;
+}
+
+bool UUTVehicleComponent::FindSafeExitLocation(AUTCharacter* Character, FVector& OutLocation, FRotator& OutRotation) const
+{
+	AActor* Owner = GetOwner();
+	UWorld* World = GetWorld();
+	UCapsuleComponent* Capsule = Character != nullptr ? Character->GetCapsuleComponent() : nullptr;
+	if (Owner == nullptr || World == nullptr || Character == nullptr || Capsule == nullptr)
+	{
+		return false;
+	}
+
+	FVector BoundsOrigin;
+	FVector BoundsExtent;
+	Owner->GetActorBounds(true, BoundsOrigin, BoundsExtent);
+	const float CapsuleRadius = Capsule->GetScaledCapsuleRadius();
+	const float CapsuleHalfHeight = Capsule->GetScaledCapsuleHalfHeight();
+	const FVector Forward = Owner->GetActorForwardVector().GetSafeNormal2D();
+	const FVector Right = Owner->GetActorRightVector().GetSafeNormal2D();
+	const FVector Directions[] = { Right, -Right, -Forward, Forward };
+
+	FCollisionQueryParams TraceParams(FName(TEXT("VehicleExitGround")), false, Owner);
+	TraceParams.AddIgnoredActor(Character);
+	OutRotation = FRotator(0.0f, Owner->GetActorRotation().Yaw, 0.0f);
+
+	for (const FVector& Direction : Directions)
+	{
+		// Project the world AABB onto the requested exit direction so large flyers
+		// clear their wings while compact cars do not throw the driver far away.
+		const float ProjectedExtent = FMath::Abs(Direction.X) * BoundsExtent.X + FMath::Abs(Direction.Y) * BoundsExtent.Y;
+		const FVector PlanarLocation = BoundsOrigin + Direction * (ProjectedExtent + CapsuleRadius + 60.0f);
+		const FVector TraceStart(PlanarLocation.X, PlanarLocation.Y,
+			BoundsOrigin.Z + BoundsExtent.Z + CapsuleHalfHeight + 150.0f);
+		const FVector TraceEnd(PlanarLocation.X, PlanarLocation.Y,
+			BoundsOrigin.Z - BoundsExtent.Z - 1200.0f);
+
+		FHitResult GroundHit;
+		if (!World->LineTraceSingleByChannel(GroundHit, TraceStart, TraceEnd, ECC_WorldStatic, TraceParams))
+		{
+			continue;
+		}
+
+		const FVector RequestedLocation = GroundHit.ImpactPoint + FVector::UpVector * (CapsuleHalfHeight + 4.0f);
+		FVector AdjustedLocation = RequestedLocation;
+		if (World->FindTeleportSpot(Character, AdjustedLocation, OutRotation) &&
+			FVector::DistSquared(AdjustedLocation, RequestedLocation) <= FMath::Square(200.0f))
+		{
+			OutLocation = AdjustedLocation;
+			UE_LOG(LogTemp, Warning, TEXT("[VehicleExit] Safe exit Vehicle=%s Driver=%s Location=%s Ground=%s"),
+				*GetNameSafe(Owner), *GetNameSafe(Character), *OutLocation.ToString(), *GetNameSafe(GroundHit.GetActor()));
+			return true;
+		}
+	}
+
+	return false;
 }
 
 float UUTVehicleComponent::ApplyDamage(float Damage, const FDamageEvent& DamageEvent, AController* EventInstigator, AActor* DamageCauser)
 {
-	if (bDead)
+	AActor* Owner = GetOwner();
+	if (Owner == nullptr || Owner->Role != ROLE_Authority || bDead || Damage <= 0.0f)
 	{
 		return 0.0f;
 	}
@@ -464,6 +763,11 @@ void UUTVehicleComponent::VehicleDied(AController* Killer)
 
 void UUTVehicleComponent::OnRep_Driver()
 {
+	if (Driver != nullptr)
+	{
+		UnbindEntryInput();
+	}
+
 	// Restore the previous client-side driver before applying a newly
 	// replicated one. This also fixes leaving a vehicle, where Driver is null.
 	if (VisualDriver != nullptr && VisualDriver != Driver)
@@ -492,15 +796,41 @@ void UUTVehicleComponent::OnRep_Driver()
 	}
 }
 
+void UUTVehicleComponent::OnRep_EntryLocked()
+{
+	RefreshEntryInput();
+}
+
+void UUTVehicleComponent::RefreshEntryInput()
+{
+	if (EntryInputComponent != nullptr &&
+		(EntryInputPawn == nullptr || !CanEnterVehicle(EntryInputPawn)))
+	{
+		UnbindEntryInput();
+	}
+
+	if (EntryInputComponent == nullptr && !bEntryLocked && Driver == nullptr && !bDead)
+	{
+		for (APawn* Candidate : OverlappingPawns)
+		{
+			if (Candidate != nullptr && Candidate->IsLocallyControlled() && CanEnterVehicle(Candidate))
+			{
+				BindEntryInput(Candidate);
+				break;
+			}
+		}
+	}
+}
+
 void UUTVehicleComponent::DrawEntryPrompt(AUTHUD* HUD, UCanvas* Canvas, APlayerController* ViewingPC)
 {
-	if (Canvas == nullptr || HUD == nullptr || ViewingPC == nullptr || Driver != nullptr || bDead)
+	if (Canvas == nullptr || HUD == nullptr || ViewingPC == nullptr)
 	{
 		return;
 	}
 
 	APawn* ViewingPawn = ViewingPC->GetPawn();
-	if (ViewingPawn == nullptr || !IsInEntryRange(ViewingPawn))
+	if (!CanEnterVehicle(ViewingPawn))
 	{
 		return;
 	}
@@ -517,8 +847,14 @@ void UUTVehicleComponent::DrawEntryPrompt(AUTHUD* HUD, UCanvas* Canvas, APlayerC
 		}
 	}
 
-	const FString Prompt = FString::Printf(TEXT("Press %s to enter vehicle"), *KeyName);
-	UFont* PromptFont = GEngine != nullptr ? GEngine->GetMediumFont() : nullptr;
+	FFormatNamedArguments PromptArgs;
+	PromptArgs.Add(TEXT("Key"), FText::FromString(KeyName));
+	const FText Prompt = FText::Format(
+		NSLOCTEXT("UTVehicles", "EnterVehiclePrompt", "Press {Key} to enter vehicle"),
+		PromptArgs);
+	// Match Blitz's GameMessages announcement treatment: native UT medium font,
+	// white text, a small black shadow, and the 0.68 announcement slot.
+	UFont* PromptFont = HUD->GetFontFromSizeIndex(2);
 	if (PromptFont == nullptr)
 	{
 		return;
@@ -526,17 +862,12 @@ void UUTVehicleComponent::DrawEntryPrompt(AUTHUD* HUD, UCanvas* Canvas, APlayerC
 
 	float TextWidth = 0.0f;
 	float TextHeight = 0.0f;
-	Canvas->TextSize(PromptFont, Prompt, TextWidth, TextHeight);
-	const float PadX = 18.0f;
-	const float PadY = 10.0f;
+	Canvas->TextSize(PromptFont, Prompt.ToString(), TextWidth, TextHeight);
 	const float TextX = (Canvas->ClipX - TextWidth) * 0.5f;
-	const float TextY = Canvas->ClipY * 0.72f;
-
-	Canvas->SetDrawColor(0, 0, 0, 180);
-	Canvas->DrawTile(Canvas->DefaultTexture, TextX - PadX, TextY - PadY,
-		TextWidth + PadX * 2.0f, TextHeight + PadY * 2.0f, 0, 0, 1, 1);
-	Canvas->SetDrawColor(255, 220, 96, 255);
-	Canvas->DrawText(PromptFont, Prompt, TextX, TextY);
+	const float TextY = Canvas->ClipY * 0.68f;
+	FCanvasTextItem PromptItem(FVector2D(TextX, TextY), Prompt, PromptFont, FLinearColor::White);
+	PromptItem.EnableShadow(FLinearColor::Black, FVector2D(1.0f, 2.0f));
+	Canvas->DrawItem(PromptItem);
 }
 
 void UUTVehicleComponent::DrawVehicleHUD(AUTHUD* HUD, UCanvas* Canvas, APlayerController* ViewingPC)

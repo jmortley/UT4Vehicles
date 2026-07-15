@@ -15,6 +15,10 @@ class UTVEHICLES_API UUTVehicleMeshComponent : public USkeletalMeshComponent
 	GENERATED_UCLASS_BODY()
 
 public:
+	/** Mesh-space lift applied after matching a visual wheel to its PhysX center. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Vehicle)
+	float VisualWheelCenterOffsetZ;
+
 	virtual void RefreshBoneTransforms(FActorComponentTickFunction* TickFunction = nullptr) override;
 
 private:

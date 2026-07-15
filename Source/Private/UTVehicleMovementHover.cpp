@@ -10,13 +10,18 @@ UUTVehicleMovementHover::UUTVehicleMovementHover()
 	MaxSpeed = 2200.0f;
 	MaxAltitude = 4000.0f;
 	ThrustForce = 3000.0f;
+	ReverseThrustForce = 1500.0f;
 	LiftForce = 2500.0f;
 	StrafeForce = 1500.0f;
 	GravityForce = 980.0f;
 	TurnRate = 120.0f;
 	PitchRate = 60.0f;
-	VelocityDamping = 0.02f;
+	VelocityDamping = 0.7f;
+	StopThreshold = 100.0f;
 	MinHoverHeight = 100.0f;
+	HoverVerticalDamping = 6.0f;
+	ParkedGroundClearance = 60.0f;
+	ParkedDescentSpeed = 400.0f;
 
 	RawThrottleInput = 0.0f;
 	RawSteeringInput = 0.0f;
@@ -97,7 +102,14 @@ void UUTVehicleMovementHover::TickComponent(float DeltaTime, ELevelTick TickType
 	// On server or standalone: apply physics
 	if (Owner->Role == ROLE_Authority)
 	{
-		UpdateFlightPhysics(DeltaTime);
+		if (Owner->Controller == nullptr)
+		{
+			UpdateParkedPhysics(DeltaTime);
+		}
+		else
+		{
+			UpdateFlightPhysics(DeltaTime);
+		}
 
 		// Update replicated state
 		ReplicatedState.ThrottleInput = RawThrottleInput;
@@ -118,9 +130,40 @@ void UUTVehicleMovementHover::TickComponent(float DeltaTime, ELevelTick TickType
 	}
 	else
 	{
-		// Locally controlled on authority (listen server host): apply physics directly
+		// Preserve local prediction for the owning client while the server runs
+		// the authoritative copy from the submitted input state.
 		UpdateFlightPhysics(DeltaTime);
 	}
+}
+
+void UUTVehicleMovementHover::UpdateParkedPhysics(float DeltaTime)
+{
+	APawn* Owner = Cast<APawn>(GetOwner());
+	if (Owner == nullptr || UpdatedComponent == nullptr)
+	{
+		return;
+	}
+
+	// UT3 flyers rest on their landing gear until somebody enters. Do not run
+	// the active hover spring while empty: gravity and repulsion otherwise trade
+	// energy and make the parked vehicle bob forever.
+	RawThrottleInput = 0.0f;
+	RawSteeringInput = 0.0f;
+	RawLiftInput = 0.0f;
+	RawPitchInput = 0.0f;
+	Velocity = FVector::ZeroVector;
+
+	const float GroundDistance = GetGroundDistance();
+	const float VerticalCorrection = ParkedGroundClearance - GroundDistance;
+	const float MaxStep = FMath::Max(ParkedDescentSpeed, 0.0f) * DeltaTime;
+	const float MoveZ = FMath::Clamp(VerticalCorrection, -MaxStep, MaxStep);
+
+	FRotator ParkedRotation = Owner->GetActorRotation();
+	ParkedRotation.Pitch = FMath::FInterpTo(ParkedRotation.Pitch, 0.0f, DeltaTime, 4.0f);
+	ParkedRotation.Roll = FMath::FInterpTo(ParkedRotation.Roll, 0.0f, DeltaTime, 4.0f);
+
+	FHitResult Hit;
+	SafeMoveUpdatedComponent(FVector(0.0f, 0.0f, MoveZ), ParkedRotation, true, Hit);
 }
 
 void UUTVehicleMovementHover::UpdateFlightPhysics(float DeltaTime)
@@ -133,13 +176,14 @@ void UUTVehicleMovementHover::UpdateFlightPhysics(float DeltaTime)
 
 	FRotator CurrentRotation = Owner->GetActorRotation();
 
-	// Apply yaw from steering input
-	float YawDelta = RawSteeringInput * TurnRate * DeltaTime;
-	CurrentRotation.Yaw += YawDelta;
-
-	// Apply pitch from mouse look (clamped)
-	float PitchDelta = RawPitchInput * PitchRate * DeltaTime;
-	CurrentRotation.Pitch = FMath::Clamp(CurrentRotation.Pitch + PitchDelta, -60.0f, 60.0f);
+	// Mouse/controller view supplies heading and aim. Movement keys never alter
+	// altitude: W/S use a yaw-only forward vector and A/D use its right vector.
+	const FRotator ViewRotation = Owner->Controller != nullptr
+		? Owner->Controller->GetControlRotation()
+		: CurrentRotation;
+	const float ViewPitch = FMath::Clamp(FRotator::NormalizeAxis(ViewRotation.Pitch), -45.0f, 45.0f);
+	CurrentRotation.Yaw = FMath::FixedTurn(CurrentRotation.Yaw, ViewRotation.Yaw, TurnRate * DeltaTime);
+	CurrentRotation.Pitch = FMath::FInterpTo(CurrentRotation.Pitch, ViewPitch, DeltaTime, 4.0f);
 
 	// Roll follows steering for visual feel
 	float TargetRoll = -RawSteeringInput * 25.0f;
@@ -147,29 +191,39 @@ void UUTVehicleMovementHover::UpdateFlightPhysics(float DeltaTime)
 
 	Owner->SetActorRotation(CurrentRotation);
 
-	// Calculate thrust direction from forward vector
-	FVector ForwardDir = CurrentRotation.Vector();
-	FVector RightDir = FRotationMatrix(CurrentRotation).GetScaledAxis(EAxis::Y);
+	// Planar directions are camera-relative but deliberately ignore camera pitch.
+	const FRotator PlanarView(0.0f, ViewRotation.Yaw, 0.0f);
+	FVector ForwardDir = PlanarView.Vector();
+	FVector RightDir = FRotationMatrix(PlanarView).GetScaledAxis(EAxis::Y);
 	FVector UpDir = FVector::UpVector;
 
 	// Build acceleration from inputs
 	FVector Acceleration = FVector::ZeroVector;
 
-	// Forward/backward thrust
-	Acceleration += ForwardDir * RawThrottleInput * ThrustForce;
+	// UT3's chopper simulation has separate forward/reverse forces. In
+	// particular, the Raptor uses only 100/750 of its forward force in reverse.
+	const float LongitudinalForce = RawThrottleInput >= 0.0f ? ThrustForce : ReverseThrustForce;
+	Acceleration += ForwardDir * RawThrottleInput * LongitudinalForce;
 
-	// Vertical lift
-	Acceleration += UpDir * RawLiftInput * LiftForce;
+	// Left/right strafe. Steering input is not yaw for UT3-style Raptor flight.
+	Acceleration += RightDir * RawSteeringInput * StrafeForce;
 
-	// Gravity (always pulling down when not lifting)
-	if (RawLiftInput <= 0.0f)
+	// UT3's Raptor holds altitude like a Harrier when neither vertical control
+	// is pressed. Space applies lift and Crouch applies descent; neutral input
+	// arrests only vertical inertia without disturbing planar flight.
+	const bool bAscending = RawLiftInput > KINDA_SMALL_NUMBER;
+	const bool bDescending = RawLiftInput < -KINDA_SMALL_NUMBER;
+	if (bAscending)
 	{
-		Acceleration -= UpDir * GravityForce;
+		Acceleration += UpDir * (RawLiftInput * LiftForce - GravityForce * 0.3f);
+	}
+	else if (bDescending)
+	{
+		Acceleration += UpDir * RawLiftInput * LiftForce;
 	}
 	else
 	{
-		// Reduced gravity when actively lifting
-		Acceleration -= UpDir * GravityForce * 0.3f;
+		Velocity.Z = FMath::FInterpTo(Velocity.Z, 0.0f, DeltaTime, HoverVerticalDamping);
 	}
 
 	// Ground repulsion - hover effect
@@ -177,14 +231,22 @@ void UUTVehicleMovementHover::UpdateFlightPhysics(float DeltaTime)
 	if (GroundDist < MinHoverHeight)
 	{
 		float RepulsionStrength = (1.0f - (GroundDist / MinHoverHeight)) * LiftForce * 2.0f;
+		RepulsionStrength -= Velocity.Z * HoverVerticalDamping;
 		Acceleration += UpDir * RepulsionStrength;
 	}
 
 	// Apply acceleration to velocity
 	Velocity += Acceleration * DeltaTime;
 
-	// Apply damping
-	Velocity *= (1.0f - VelocityDamping);
+	// UT3's Long/Lat/Up damping values are continuous coefficients, not a fixed
+	// percentage removed once per frame. Exponential damping preserves the same
+	// response at 30, 60, and 120 Hz.
+	Velocity *= FMath::Exp(-FMath::Max(VelocityDamping, 0.0f) * DeltaTime);
+	if (FMath::IsNearlyZero(RawThrottleInput) && FMath::IsNearlyZero(RawSteeringInput) &&
+		FMath::IsNearlyZero(RawLiftInput) && Velocity.SizeSquared() < FMath::Square(StopThreshold))
+	{
+		Velocity = FVector::ZeroVector;
+	}
 
 	// Clamp speed
 	float CurrentSpeed = Velocity.Size();

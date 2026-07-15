@@ -25,6 +25,11 @@ namespace UnrealBuildTool.Rules
 				"InputCore",
 				"PhysXVehicles"
 			});
+
+			PrivateDependencyModuleNames.AddRange(new string[]
+			{
+				"Slate"
+			});
 		}
 	}
 }

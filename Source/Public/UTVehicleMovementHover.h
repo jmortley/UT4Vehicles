@@ -63,6 +63,10 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Movement)
 	float ThrustForce;
 
+	/** Reverse thrust force. UT3 flyers deliberately reverse much more slowly. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Movement)
+	float ReverseThrustForce;
+
 	/** Vertical lift force */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Movement)
 	float LiftForce;
@@ -71,7 +75,7 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Movement)
 	float StrafeForce;
 
-	/** Gravity applied when not actively lifting */
+	/** Counter-gravity applied while actively ascending. Neutral input holds altitude. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Movement)
 	float GravityForce;
 
@@ -83,13 +87,29 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Movement)
 	float PitchRate;
 
-	/** Velocity damping factor (0-1, higher = more damping) */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Movement, meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	/** Velocity damping coefficient per second (frame-rate independent). */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Movement, meta = (ClampMin = "0.0"))
 	float VelocityDamping;
+
+	/** Speeds below this are stopped when the driver releases every movement input. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Movement, meta = (ClampMin = "0.0"))
+	float StopThreshold;
 
 	/** Minimum hover height above ground (UU) */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Movement)
 	float MinHoverHeight;
+
+	/** Vertical damping applied to the active ground-hover spring. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Movement)
+	float HoverVerticalDamping;
+
+	/** Ground distance used while the vehicle is empty and parked. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Movement)
+	float ParkedGroundClearance;
+
+	/** Maximum downward parking speed after a driver exits in the air. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Movement)
+	float ParkedDescentSpeed;
 
 	// --- Input ---
 
@@ -132,6 +152,7 @@ protected:
 
 	/** Apply physics simulation for one tick */
 	void UpdateFlightPhysics(float DeltaTime);
+	void UpdateParkedPhysics(float DeltaTime);
 
 	/** Check ground distance for hover behavior */
 	float GetGroundDistance() const;

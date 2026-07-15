@@ -6,6 +6,7 @@
 #include "Components/AudioComponent.h"
 #include "Components/InputComponent.h"
 #include "GameFramework/PlayerInput.h"
+#include "InputCoreTypes.h"
 #include "Kismet/GameplayStatics.h"
 #include "Sound/SoundBase.h"
 #include "Sound/SoundAttenuation.h"
@@ -64,6 +65,11 @@ AUTVehicle::AUTVehicle(const FObjectInitializer& ObjectInitializer)
 	ReverseAxisValue = 0.0f;
 	SteerRightAxisValue = 0.0f;
 	SteerLeftAxisValue = 0.0f;
+	bHandbrakeInputDown = false;
+	bPrimaryFireKeyDown = false;
+	bAltFireKeyDown = false;
+	bPrimaryFireInputDown = false;
+	bAltFireInputDown = false;
 	NextDriveInputLogTime = 0.0f;
 	LastImpactSoundTime = -1000.0f;
 }
@@ -353,6 +359,10 @@ void AUTVehicle::BindDrivingInput()
 		UE_LOG(LogTemp, Warning, TEXT("[VehicleInput] Bind skipped: PlayerInput is null"));
 		return;
 	}
+	if (BoundInputPC == PC && DrivingInputComponent != nullptr)
+	{
+		return;
+	}
 
 	UnbindDrivingInput();
 	BoundInputPC = PC;
@@ -374,13 +384,31 @@ void AUTVehicle::BindDrivingInput()
 	IC->BindAxis("MoveBackward", this, &AUTVehicle::OnReverseInput);
 	IC->BindAxis("MoveRight", this, &AUTVehicle::OnSteeringInput);
 	IC->BindAxis("MoveLeft", this, &AUTVehicle::OnSteerLeftInput);
-	IC->BindAction("Jump", IE_Pressed, this, &AUTVehicle::OnHandbrakePressed);
-	IC->BindAction("Jump", IE_Released, this, &AUTVehicle::OnHandbrakeReleased);
+	IC->BindAction("Jump", IE_Pressed, this, &AUTVehicle::HandleHandbrakePressed);
+	IC->BindAction("Jump", IE_Released, this, &AUTVehicle::HandleHandbrakeReleased);
+	// Observe physical press state without consuming it; AUTPlayerController's
+	// lower component still owns held flags, input gating, and deferred dispatch.
+	// Direct releases supply the non-character stop callback that UT omits.
+	FInputActionBinding& PrimaryFirePressed = IC->BindAction(
+		"StartFire", IE_Pressed, this, &AUTVehicle::HandlePrimaryFirePressed);
+	PrimaryFirePressed.bConsumeInput = false;
+	FInputActionBinding& PrimaryFireReleased = IC->BindAction(
+		"StopFire", IE_Released, this, &AUTVehicle::HandlePrimaryFireReleased);
+	PrimaryFireReleased.bConsumeInput = false;
+	FInputActionBinding& AltFirePressed = IC->BindAction(
+		"StartAltFire", IE_Pressed, this, &AUTVehicle::HandleAltFirePressed);
+	AltFirePressed.bConsumeInput = false;
+	FInputActionBinding& AltFireReleased = IC->BindAction(
+		"StopAltFire", IE_Released, this, &AUTVehicle::HandleAltFireReleased);
+	AltFireReleased.bConsumeInput = false;
+	FInputKeyBinding& HornBinding = IC->BindKey(EKeys::H, IE_Pressed, this, &AUTVehicle::OnHornPressed);
+	HornBinding.bConsumeInput = true;
 	// Match UT3's use flow: the same stock, remappable ActivateSpecial action
 	// enters nearby vehicles and exits the currently possessed vehicle.
 	FInputActionBinding& ExitBinding = IC->BindAction(
 		"ActivateSpecial", IE_Pressed, this, &AUTVehicle::ServerDriverLeave);
 	ExitBinding.bConsumeInput = true;
+	BindVehicleSpecificInput(IC);
 	IC->RegisterComponent();
 	PC->PushInputComponent(IC);
 
@@ -401,6 +429,12 @@ void AUTVehicle::BindDrivingInput()
 
 void AUTVehicle::UnbindDrivingInput()
 {
+	// Continuous vehicle abilities must receive a release even when possession,
+	// controller replication, or a rebind removes the capture while a key is held.
+	HandleHandbrakeReleased();
+	HandlePrimaryFireReleased();
+	HandleAltFireReleased();
+
 	if (BoundInputPC != nullptr && DrivingInputComponent != nullptr)
 	{
 		BoundInputPC->PopInputComponent(DrivingInputComponent);
@@ -571,6 +605,115 @@ void AUTVehicle::OnHandbrakeReleased()
 	}
 }
 
+void AUTVehicle::OnPrimaryFirePressed()
+{
+}
+
+void AUTVehicle::OnPrimaryFireReleased()
+{
+}
+
+void AUTVehicle::OnAltFirePressed()
+{
+}
+
+void AUTVehicle::OnAltFireReleased()
+{
+}
+
+void AUTVehicle::HandleHandbrakePressed()
+{
+	if (!bHandbrakeInputDown)
+	{
+		bHandbrakeInputDown = true;
+		OnHandbrakePressed();
+	}
+}
+
+void AUTVehicle::HandleHandbrakeReleased()
+{
+	if (bHandbrakeInputDown)
+	{
+		bHandbrakeInputDown = false;
+		OnHandbrakeReleased();
+	}
+}
+
+void AUTVehicle::HandlePrimaryFirePressed()
+{
+	bPrimaryFireKeyDown = true;
+}
+
+void AUTVehicle::HandlePrimaryFireReleased()
+{
+	bPrimaryFireKeyDown = false;
+	StopVehicleFire(0);
+}
+
+void AUTVehicle::HandleAltFirePressed()
+{
+	bAltFireKeyDown = true;
+}
+
+void AUTVehicle::HandleAltFireReleased()
+{
+	bAltFireKeyDown = false;
+	StopVehicleFire(1);
+}
+
+void AUTVehicle::BindVehicleSpecificInput(UInputComponent*)
+{
+}
+
+void AUTVehicle::PawnStartFire(uint8 FireModeNum)
+{
+	// AUTPlayerController forwards deferred press events to any pawn, but only
+	// forwards releases to AUTCharacter. Physical-key state rejects a deferred
+	// press if that key was already released in the same input frame.
+	if (FireModeNum == 0)
+	{
+		if (!bPrimaryFireInputDown && (BoundInputPC == nullptr || bPrimaryFireKeyDown))
+		{
+			bPrimaryFireInputDown = true;
+			OnPrimaryFirePressed();
+		}
+	}
+	else if (FireModeNum == 1)
+	{
+		if (!bAltFireInputDown && (BoundInputPC == nullptr || bAltFireKeyDown))
+		{
+			bAltFireInputDown = true;
+			OnAltFirePressed();
+		}
+	}
+	else
+	{
+		Super::PawnStartFire(FireModeNum);
+	}
+}
+
+void AUTVehicle::StopVehicleFire(uint8 FireModeNum)
+{
+	if (FireModeNum == 0 && bPrimaryFireInputDown)
+	{
+		bPrimaryFireInputDown = false;
+		OnPrimaryFireReleased();
+	}
+	else if (FireModeNum == 1 && bAltFireInputDown)
+	{
+		bAltFireInputDown = false;
+		OnAltFireReleased();
+	}
+}
+
+void AUTVehicle::OnHornPressed()
+{
+	if (VehicleComponent != nullptr)
+	{
+		VehicleComponent->RequestHorn();
+	}
+}
+
 float AUTVehicle::TakeDamage(float Damage, const FDamageEvent& DamageEvent, AController* EventInstigator, AActor* DamageCauser)
 {
 	if (VehicleComponent != nullptr)
@@ -615,22 +758,6 @@ void AUTVehicle::PostRenderFor(APlayerController* PC, UCanvas* Canvas, FVector C
 	}
 }
 
-bool AUTVehicle::ServerTryEnter_Validate(APawn* NewDriver)
-{
-	return true;
-}
-
-void AUTVehicle::ServerTryEnter_Implementation(APawn* NewDriver)
-{
-	// Empty vehicles temporarily belong to the overlapping player's controller.
-	// Reject spoofed pawn pointers even though TryToDrive also validates range.
-	if (VehicleComponent != nullptr && NewDriver != nullptr &&
-		NewDriver->Controller != nullptr && GetOwner() == NewDriver->Controller)
-	{
-		VehicleComponent->TryToDrive(NewDriver);
-	}
-}
-
 bool AUTVehicle::ServerDriverLeave_Validate()
 {
 	return true;
@@ -638,8 +765,10 @@ bool AUTVehicle::ServerDriverLeave_Validate()
 
 void AUTVehicle::ServerDriverLeave_Implementation()
 {
-	if (VehicleComponent != nullptr)
-	{
-		VehicleComponent->DriverLeave(false);
-	}
+	HandleDriverLeaveRequest();
+}
+
+bool AUTVehicle::HandleDriverLeaveRequest()
+{
+	return VehicleComponent != nullptr && VehicleComponent->DriverLeave(false);
 }
