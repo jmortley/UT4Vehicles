@@ -9,6 +9,7 @@
 #include "GameFramework/Controller.h"
 #include "GameFramework/SpringArmComponent.h"
 #include "PhysicsEngine/BodySetup.h"
+#include "PhysicsEngine/PhysicsAsset.h"
 
 namespace
 {
@@ -123,6 +124,14 @@ AUTVehicle_Goliath::AUTVehicle_Goliath(const FObjectInitializer& ObjectInitializ
 	{
 		GetMesh()->SetSkeletalMesh(MeshFinder.Object);
 	}
+	static ConstructorHelpers::FObjectFinder<UPhysicsAsset> PhysicsFinder(
+		TEXT("/Game/RestrictedAssets/Proto/UT3_Vehicles/VH_Goliath/Meshes/PA_Goliath_ChassisOnly"));
+	if (PhysicsFinder.Succeeded())
+	{
+		// This generated asset contains only the real Chassis body. The source UT3
+		// asset has 45 constrained bodies and cannot safely back an AWheeledVehicle.
+		GetMesh()->SetPhysicsAsset(PhysicsFinder.Object, false);
+	}
 	static ConstructorHelpers::FObjectFinder<UMaterialInterface> BodyMaterialFinder(
 		TEXT("/Game/RestrictedAssets/Proto/UT3_Vehicles/VH_Goliath/Materials/M_Goliath"));
 	static ConstructorHelpers::FObjectFinder<UMaterialInterface> TreadMaterialFinder(
@@ -212,8 +221,10 @@ void AUTVehicle_Goliath::PostInitializeComponents()
 		? ChassisBody->BodySetup->AggGeom.CalcAABB(FTransform(FQuat::Identity,
 			FVector::ZeroVector, GetMesh()->GetRelativeTransform().GetScale3D()))
 		: FBox(ForceInit);
-	UE_LOG(LogTemp, Warning, TEXT("[GoliathPhysics] Setup Physics=%d ChassisBone=%s ChassisZ=(%.2f..%.2f) ParkHeight=%.2f WheelOffsetZ=(%.2f,%.2f,%.2f,%.2f)"),
+	UPhysicsAsset* PhysicsAsset = GetMesh()->GetPhysicsAsset();
+	UE_LOG(LogTemp, Warning, TEXT("[GoliathPhysics] Setup Physics=%d Asset=%s Bodies=%d ChassisBone=%s ChassisZ=(%.2f..%.2f) ParkHeight=%.2f WheelOffsetZ=(%.2f,%.2f,%.2f,%.2f)"),
 		Movement != nullptr && Movement->HasValidPhysicsState() ? 1 : 0,
+		*GetNameSafe(PhysicsAsset), PhysicsAsset != nullptr ? PhysicsAsset->SkeletalBodySetups.Num() : 0,
 		ChassisBody != nullptr && ChassisBody->BodySetup != nullptr
 			? *ChassisBody->BodySetup->BoneName.ToString() : TEXT("NONE"),
 		ChassisBounds.IsValid ? ChassisBounds.Min.Z : 0.0f,
@@ -250,16 +261,13 @@ void AUTVehicle_Goliath::BeginPlay()
 			{
 				// Sleeping is not a parking lock: PhysX may wake the body later and a
 				// single bad suspension/depenetration step can cross the entire map
-				// before the next actor tick. Disable physical response and gravity on
-				// the untouched spawn while retaining query collision, so the nearby
-				// entry prompt and RPC still see the tank. Keeping the body simulated
-				// also preserves the already-created PhysX vehicle state for entry.
+				// before the next actor tick. The clean one-body asset makes it safe to
+				// use a true kinematic lock until the first driver arrives.
 				Movement->Deactivate();
 			}
 			if (FBodyInstance* ChassisBody = GetMesh()->GetBodyInstance())
 			{
-				ChassisBody->SetCollisionEnabled(ECollisionEnabled::QueryOnly);
-				GetMesh()->SetEnableGravity(false);
+				ChassisBody->SetInstanceSimulatePhysics(false);
 				bSpawnParkingLocked = true;
 			}
 			UE_LOG(LogTemp, Warning, TEXT("[GoliathParking] Spawn parked Vehicle=%s GroundZ=%.2f ActorZ=%.2f Height=%.2f"),
@@ -333,14 +341,13 @@ void AUTVehicle_Goliath::UpdateVacantParking(float DeltaSeconds)
 	{
 		if (bSpawnParkingLocked)
 		{
-			// Restore only the chassis body's physical response. Never recreate the
-			// skeletal or movement physics states here: doing so resurrects the
-			// imported turret/tread bodies that AUTVehicle deliberately strips out.
+			// The override asset contains only this body, so reinitializing the PhysX
+			// vehicle cannot resurrect imported turret or tread bodies.
 			if (FBodyInstance* ChassisBody = GetMesh()->GetBodyInstance())
 			{
-				ChassisBody->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+				ChassisBody->SetInstanceSimulatePhysics(true);
 			}
-			GetMesh()->SetEnableGravity(true);
+			Movement->RecreatePhysicsState();
 			bSpawnParkingLocked = false;
 			UE_LOG(LogTemp, Warning, TEXT("[GoliathParking] Spawn lock released Vehicle=%s Role=%d Physics=%d"),
 				*GetName(), (int32)Role, GetMesh()->IsSimulatingPhysics() ? 1 : 0);

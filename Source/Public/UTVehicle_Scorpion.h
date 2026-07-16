@@ -98,6 +98,14 @@ public:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Scorpion|Handling")
 	float VacantStopDeceleration;
 
+	/** UT4-scaled normal driving target; boost has its own higher target. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Scorpion|Handling")
+	float NormalDriveTargetSpeed;
+
+	/** Arcade acceleration assist that carries the heavy chassis to its target speed. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Scorpion|Handling")
+	float NormalDriveAcceleration;
+
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Scorpion|Self Destruct")
 	float SelfDestructMinBoostTime;
 
@@ -127,6 +135,7 @@ public:
 	bool ShouldShowBoostEjectPrompt() const;
 
 protected:
+	virtual void OnThrottleInput(float Value) override;
 	virtual void OnHandbrakePressed() override;
 	virtual void OnHandbrakeReleased() override;
 	virtual void OnAltFirePressed() override;
@@ -139,6 +148,10 @@ protected:
 
 	UFUNCTION(Reliable, Server, WithValidation)
 	void ServerStartBoost();
+
+	/** Replicate the owning client's forward input for authoritative speed assist. */
+	UFUNCTION(Reliable, Server, WithValidation)
+	void ServerSetNormalDriveThrottle(float NewThrottle);
 
 	UFUNCTION()
 	void OnRep_BladeState();
@@ -165,6 +178,7 @@ protected:
 	bool StartBoost();
 	void StopBoost();
 	void ApplyBoostForce();
+	void ApplyNormalDriveAssist();
 	void ApplyGroundStability(float DeltaSeconds);
 	void ApplyVacantStop(float DeltaSeconds);
 	bool ReadyToSelfDestruct() const;
@@ -175,6 +189,8 @@ protected:
 
 	float BoostStartTime;
 	float NextBoostTime;
+	float NormalDriveThrottle;
+	float LastSentNormalDriveThrottle;
 	bool bHavePreviousBladePositions;
 	bool bHasSelfDestructed;
 	FVector PreviousLeftBladeStart;

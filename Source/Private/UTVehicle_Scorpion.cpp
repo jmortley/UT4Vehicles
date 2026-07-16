@@ -96,10 +96,10 @@ namespace
 		Movement4W->TransmissionSetup.NeutralGearUpRatio = 0.15f;
 		Movement4W->TransmissionSetup.GearSwitchTime = 0.15f;
 		Movement4W->TransmissionSetup.GearAutoBoxLatency = 2.0f;
-		// Live PhysX telemetry with the nominal 8:1 setup settled at only 1590
-		// uu/s despite the intended 2300 target. A 1.4 final drive corrects the
-		// observed effective ratio while retaining the same one-gear curve.
-		Movement4W->TransmissionSetup.FinalRatio = 1.4f;
+		// Keep the useful wheel torque of the original 8:1 setup. Top speed is
+		// supplied by the UT-style chassis assist below instead of sacrificing
+		// launch and hill-climbing torque with an excessively tall final drive.
+		Movement4W->TransmissionSetup.FinalRatio = 2.0f;
 		Movement4W->TransmissionSetup.ReverseGearRatio = -4.0f;
 		Movement4W->TransmissionSetup.ForwardGears.SetNum(1);
 		Movement4W->TransmissionSetup.ForwardGears[0].Ratio = 4.0f;
@@ -169,8 +169,8 @@ AUTVehicle_Scorpion::AUTVehicle_Scorpion(const FObjectInitializer& ObjectInitial
 	bSelfDestructArmed = false;
 	MaxBoostDuration = 2.0f;
 	BoostRechargeDuration = 5.0f;
-	BoostTargetSpeed = 3800.0f;
-	BoostAcceleration = 7000.0f;
+	BoostTargetSpeed = 4400.0f;
+	BoostAcceleration = 8500.0f;
 	BoostDamageMultiplier = 1.5f;
 	GroundDownforceAcceleration = 3200.0f;
 	GroundDownforceTargetSpeed = 1800.0f;
@@ -179,6 +179,10 @@ AUTVehicle_Scorpion::AUTVehicle_Scorpion(const FObjectInitializer& ObjectInitial
 	GroundRollDamping = 12.0f;
 	GroundPitchDamping = 7.0f;
 	VacantStopDeceleration = 6000.0f;
+	// A UT4 dodge peaks around 1700 uu/s. Normal Scorpion travel must separate
+	// decisively from infantry, while boost remains a distinct upper band.
+	NormalDriveTargetSpeed = 2800.0f;
+	NormalDriveAcceleration = 4500.0f;
 	SelfDestructMinBoostTime = 0.15f;
 	SelfDestructMinSpeed = 1800.0f;
 	SelfDestructFuseDuration = 1.0f;
@@ -188,6 +192,8 @@ AUTVehicle_Scorpion::AUTVehicle_Scorpion(const FObjectInitializer& ObjectInitial
 	ArmedDamageMultiplier = 2.0f;
 	BoostStartTime = -1000.0f;
 	NextBoostTime = -1000.0f;
+	NormalDriveThrottle = 0.0f;
+	LastSentNormalDriveThrottle = 0.0f;
 	bHavePreviousBladePositions = false;
 	bHasSelfDestructed = false;
 	SelfDestructInstigator = nullptr;
@@ -311,7 +317,7 @@ void AUTVehicle_Scorpion::PostInitializeComponents()
 		}
 		const FVector LocalCOM = GetMesh()->GetComponentTransform().InverseTransformPosition(
 			GetMesh()->GetCenterOfMass());
-		UE_LOG(LogTemp, Warning, TEXT("[VehiclePhysics] Applied Scorpion drive setup Physics=%d ChassisBone=%s ChassisZ=(%.2f..%.2f) COM=%s COMNudge=%s WheelOffsetZ=(%.2f,%.2f,%.2f,%.2f) MeshClass=%s Tire=%s Friction=%.2f FinalRatio=%.2f PeakTorque=%.1f Diff=%d FrontSplit=%.2f"),
+		UE_LOG(LogTemp, Warning, TEXT("[VehiclePhysics] Applied Scorpion drive setup Physics=%d ChassisBone=%s ChassisZ=(%.2f..%.2f) COM=%s COMNudge=%s WheelOffsetZ=(%.2f,%.2f,%.2f,%.2f) MeshClass=%s Tire=%s Friction=%.2f FinalRatio=%.2f PeakTorque=%.1f Diff=%d FrontSplit=%.2f Cruise=%.0f Assist=%.0f Boost=%.0f"),
 			Movement4W->HasValidPhysicsState() ? 1 : 0,
 			*ChassisBoneName,
 			ChassisBounds.IsValid ? ChassisBounds.Min.Z : 0.0f,
@@ -328,7 +334,10 @@ void AUTVehicle_Scorpion::PostInitializeComponents()
 			Movement4W->TransmissionSetup.FinalRatio,
 			ScorpionPeakTorque,
 			(int32)Movement4W->DifferentialSetup.DifferentialType,
-			Movement4W->DifferentialSetup.FrontRearSplit);
+			Movement4W->DifferentialSetup.FrontRearSplit,
+			NormalDriveTargetSpeed,
+			NormalDriveAcceleration,
+			BoostTargetSpeed);
 	}
 }
 
@@ -360,6 +369,14 @@ void AUTVehicle_Scorpion::Tick(float DeltaSeconds)
 		{
 			ApplyBoostForce();
 		}
+	}
+	if ((Role == ROLE_Authority || IsLocallyControlled()) &&
+		!bBoostersActivated && !bSelfDestructArmed)
+	{
+		// Dedicated-server driving input lives on the autonomous proxy, which is
+		// also where the PhysX wheeled input is applied. Run normal assist there;
+		// the authority copy has no raw ThrottleAxisValue for a remote driver.
+		ApplyNormalDriveAssist();
 	}
 }
 
@@ -472,6 +489,21 @@ void AUTVehicle_Scorpion::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& 
 	DOREPLIFETIME(AUTVehicle_Scorpion, bSelfDestructArmed);
 }
 
+void AUTVehicle_Scorpion::OnThrottleInput(float Value)
+{
+	Super::OnThrottleInput(Value);
+
+	const float NewThrottle = FMath::Clamp(Value, 0.0f, 1.0f);
+	NormalDriveThrottle = NewThrottle;
+	if (Role < ROLE_Authority &&
+		(FMath::Abs(NewThrottle - LastSentNormalDriveThrottle) >= 0.1f ||
+		 (NewThrottle <= 0.01f) != (LastSentNormalDriveThrottle <= 0.01f)))
+	{
+		LastSentNormalDriveThrottle = NewThrottle;
+		ServerSetNormalDriveThrottle(NewThrottle);
+	}
+}
+
 void AUTVehicle_Scorpion::OnHandbrakePressed()
 {
 	// UT3 puts boost on the jump/handbrake input while accelerating. Preserve
@@ -517,6 +549,11 @@ void AUTVehicle_Scorpion::OnAltFireReleased()
 
 bool AUTVehicle_Scorpion::HandleDriverLeaveRequest()
 {
+	if (Role == ROLE_Authority)
+	{
+		// Never carry the previous driver's held-throttle state into the next seat.
+		NormalDriveThrottle = 0.0f;
+	}
 	const bool bReadyToEject = Role == ROLE_Authority && ReadyToSelfDestruct();
 	if (Role == ROLE_Authority)
 	{
@@ -756,6 +793,16 @@ void AUTVehicle_Scorpion::ServerStartBoost_Implementation()
 	StartBoost();
 }
 
+bool AUTVehicle_Scorpion::ServerSetNormalDriveThrottle_Validate(float NewThrottle)
+{
+	return FMath::IsFinite(NewThrottle) && NewThrottle >= -0.01f && NewThrottle <= 1.01f;
+}
+
+void AUTVehicle_Scorpion::ServerSetNormalDriveThrottle_Implementation(float NewThrottle)
+{
+	NormalDriveThrottle = FMath::Clamp(NewThrottle, 0.0f, 1.0f);
+}
+
 bool AUTVehicle_Scorpion::StartBoost()
 {
 	if (Role != ROLE_Authority || GetWorld() == nullptr || VehicleComponent == nullptr ||
@@ -804,6 +851,29 @@ void AUTVehicle_Scorpion::ApplyBoostForce()
 	{
 		const float SpeedAlpha = FMath::Clamp((BoostTargetSpeed - ForwardSpeed) / 1000.0f, 0.15f, 1.0f);
 		Mesh->AddForce(Forward * BoostAcceleration * SpeedAlpha, NAME_None, true);
+	}
+}
+
+void AUTVehicle_Scorpion::ApplyNormalDriveAssist()
+{
+	USkeletalMeshComponent* Mesh = GetMesh();
+	if (Mesh == nullptr || !Mesh->IsSimulatingPhysics() || VehicleComponent == nullptr ||
+		!VehicleComponent->HasDriver() || NormalDriveThrottle <= 0.1f)
+	{
+		return;
+	}
+
+	// Live telemetry proved that gearing changes alone simply traded wheel torque
+	// for RPM and still settled near 1400 uu/s. Supply the missing arcade thrust
+	// directly, tapering it to zero at the intended non-boosted top speed.
+	const FVector Forward = GetActorForwardVector();
+	const float ForwardSpeed = FVector::DotProduct(GetVelocity(), Forward);
+	if (ForwardSpeed < NormalDriveTargetSpeed)
+	{
+		const float SpeedAlpha = FMath::Clamp(
+			(NormalDriveTargetSpeed - ForwardSpeed) / 900.0f, 0.2f, 1.0f);
+		Mesh->AddForce(Forward * NormalDriveAcceleration * NormalDriveThrottle * SpeedAlpha,
+			NAME_None, true);
 	}
 }
 

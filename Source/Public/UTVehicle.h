@@ -100,7 +100,7 @@ public:
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
 	/** Input handlers */
-	void OnThrottleInput(float Value);
+	virtual void OnThrottleInput(float Value);
 	void OnReverseInput(float Value);
 	void OnSteeringInput(float Value);
 	void OnSteerLeftInput(float Value);

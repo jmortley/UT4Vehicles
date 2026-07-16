@@ -346,6 +346,17 @@ bool UUTVehicleComponent::IsInEntryRange(APawn* TestPawn) const
 	return OverlappingPawns.Contains(TestPawn);
 }
 
+void UUTVehicleComponent::ClearLocalEntryInput(APlayerController* LocalPC)
+{
+	if (LocalPC != nullptr && EntryInputPC == LocalPC)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[VehicleEntry] Clearing stale capture PC=%s Pawn=%s Component=%s Vehicle=%s"),
+			*GetNameSafe(LocalPC), *GetNameSafe(EntryInputPawn),
+			*GetNameSafe(EntryInputComponent), *GetNameSafe(GetOwner()));
+		UnbindEntryInput();
+	}
+}
+
 void UUTVehicleComponent::BindEntryInput(APawn* LocalPawn)
 {
 	APlayerController* PC = LocalPawn != nullptr ? Cast<APlayerController>(LocalPawn->Controller) : nullptr;

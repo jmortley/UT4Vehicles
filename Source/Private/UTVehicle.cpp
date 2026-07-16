@@ -423,6 +423,12 @@ void AUTVehicle::BindDrivingInput()
 		UE_LOG(LogTemp, Warning, TEXT("[VehicleInput] Bind skipped: PlayerInput is null"));
 		return;
 	}
+	if (VehicleComponent != nullptr)
+	{
+		// The character's priority use capture may survive possession by one frame.
+		// Remove it explicitly before installing the driver's ActivateSpecial bind.
+		VehicleComponent->ClearLocalEntryInput(PC);
+	}
 	if (BoundInputPC == PC && DrivingInputComponent != nullptr)
 	{
 		if (PC->MyHUD != nullptr)
@@ -445,7 +451,7 @@ void AUTVehicle::BindDrivingInput()
 		BoundInputPC = nullptr;
 		return;
 	}
-	DrivingInputComponent->Priority = 10000;
+	DrivingInputComponent->Priority = 20000;
 	DrivingInputComponent->bBlockInput = false;
 	UInputComponent* IC = DrivingInputComponent;
 	IC->BindAxis("MoveForward", this, &AUTVehicle::OnThrottleInput);
@@ -897,7 +903,17 @@ void AUTVehicle::PostRenderFor(APlayerController* PC, UCanvas* Canvas, FVector C
 	Super::PostRenderFor(PC, Canvas, CameraPosition, CameraDir);
 	if (VehicleComponent != nullptr && PC != nullptr)
 	{
-		VehicleComponent->DrawEntryPrompt(Cast<AUTHUD>(PC->MyHUD), Canvas, PC);
+		AUTHUD* HUD = Cast<AUTHUD>(PC->MyHUD);
+		if (PC->GetPawn() == this)
+		{
+			// AUTHUD::AddPostRenderedActor dispatches PostRenderFor, not the legacy
+			// PostRender callback. This is the occupied health/exit/eject HUD path.
+			VehicleComponent->DrawVehicleHUD(HUD, Canvas, PC);
+		}
+		else
+		{
+			VehicleComponent->DrawEntryPrompt(HUD, Canvas, PC);
+		}
 	}
 }
 

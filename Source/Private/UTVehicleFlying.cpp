@@ -96,6 +96,10 @@ void AUTVehicleFlying::BindDrivingInput()
 	{
 		return;
 	}
+	if (VehicleComponent != nullptr)
+	{
+		VehicleComponent->ClearLocalEntryInput(PC);
+	}
 	if (BoundInputPC == PC && DrivingInputComponent != nullptr)
 	{
 		if (PC->MyHUD != nullptr)
@@ -114,7 +118,7 @@ void AUTVehicleFlying::BindDrivingInput()
 		return;
 	}
 
-	DrivingInputComponent->Priority = 10000;
+	DrivingInputComponent->Priority = 20000;
 	DrivingInputComponent->bBlockInput = false;
 	UInputComponent* IC = DrivingInputComponent;
 	IC->BindAxis("MoveForward", this, &AUTVehicleFlying::OnThrottleInput);
@@ -543,7 +547,15 @@ void AUTVehicleFlying::PostRenderFor(APlayerController* PC, UCanvas* Canvas, FVe
 	Super::PostRenderFor(PC, Canvas, CameraPosition, CameraDir);
 	if (VehicleComponent != nullptr && PC != nullptr)
 	{
-		VehicleComponent->DrawEntryPrompt(Cast<AUTHUD>(PC->MyHUD), Canvas, PC);
+		AUTHUD* HUD = Cast<AUTHUD>(PC->MyHUD);
+		if (PC->GetPawn() == this)
+		{
+			VehicleComponent->DrawVehicleHUD(HUD, Canvas, PC);
+		}
+		else
+		{
+			VehicleComponent->DrawEntryPrompt(HUD, Canvas, PC);
+		}
 	}
 }
 

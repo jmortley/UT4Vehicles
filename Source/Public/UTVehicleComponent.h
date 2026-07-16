@@ -116,6 +116,9 @@ public:
 	/** Is the given pawn overlapping the entry trigger? */
 	bool IsInEntryRange(APawn* TestPawn) const;
 
+	/** Remove the now-stale nearby-use capture when this controller possesses the vehicle. */
+	void ClearLocalEntryInput(APlayerController* LocalPC);
+
 	bool HasDriver() const { return Driver != nullptr; }
 
 	/** Request a networked horn blast from the owning driver. */
