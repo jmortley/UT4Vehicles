@@ -98,6 +98,10 @@ void AUTVehicleFlying::BindDrivingInput()
 	}
 	if (BoundInputPC == PC && DrivingInputComponent != nullptr)
 	{
+		if (PC->MyHUD != nullptr)
+		{
+			PC->MyHUD->AddPostRenderedActor(this);
+		}
 		return;
 	}
 
@@ -110,7 +114,7 @@ void AUTVehicleFlying::BindDrivingInput()
 		return;
 	}
 
-	DrivingInputComponent->Priority = 100;
+	DrivingInputComponent->Priority = 10000;
 	DrivingInputComponent->bBlockInput = false;
 	UInputComponent* IC = DrivingInputComponent;
 	IC->BindAxis("MoveForward", this, &AUTVehicleFlying::OnThrottleInput);
@@ -141,11 +145,15 @@ void AUTVehicleFlying::BindDrivingInput()
 	FInputKeyBinding& HornBinding = IC->BindKey(EKeys::H, IE_Pressed, this, &AUTVehicleFlying::OnHornPressed);
 	HornBinding.bConsumeInput = true;
 	FInputActionBinding& ExitBinding = IC->BindAction(
-		"ActivateSpecial", IE_Pressed, this, &AUTVehicleFlying::ServerDriverLeave);
+		"ActivateSpecial", IE_Pressed, this, &AUTVehicleFlying::HandleActivateSpecialPressed);
 	ExitBinding.bConsumeInput = true;
 	BindVehicleSpecificInput(IC);
 	IC->RegisterComponent();
 	PC->PushInputComponent(IC);
+	if (PC->MyHUD != nullptr)
+	{
+		PC->MyHUD->AddPostRenderedActor(this);
+	}
 	UE_LOG(LogTemp, Warning, TEXT("[VehicleFlyingInput] Capture pushed PC=%s Component=%s Priority=%d"),
 		*PC->GetName(), *IC->GetName(), IC->Priority);
 }
@@ -246,6 +254,10 @@ void AUTVehicleFlying::UnbindDrivingInput()
 	HandlePrimaryFireReleased();
 	HandleAltFireReleased();
 
+	if (BoundInputPC != nullptr && BoundInputPC->MyHUD != nullptr)
+	{
+		BoundInputPC->MyHUD->RemovePostRenderedActor(this);
+	}
 	if (BoundInputPC != nullptr && DrivingInputComponent != nullptr)
 	{
 		BoundInputPC->PopInputComponent(DrivingInputComponent);
@@ -542,7 +554,24 @@ bool AUTVehicleFlying::ServerDriverLeave_Validate()
 
 void AUTVehicleFlying::ServerDriverLeave_Implementation()
 {
+	UE_LOG(LogTemp, Warning, TEXT("[VehicleFlyingExit] Server request Vehicle=%s Controller=%s Driver=%s"),
+		*GetName(), *GetNameSafe(Controller),
+		*GetNameSafe(VehicleComponent != nullptr ? VehicleComponent->Driver : nullptr));
 	HandleDriverLeaveRequest();
+}
+
+void AUTVehicleFlying::HandleActivateSpecialPressed()
+{
+	UE_LOG(LogTemp, Warning, TEXT("[VehicleFlyingExit] ActivateSpecial pressed Vehicle=%s Role=%d Local=%d Controller=%s"),
+		*GetName(), (int32)Role, IsLocallyControlled() ? 1 : 0, *GetNameSafe(Controller));
+	if (Role == ROLE_Authority)
+	{
+		HandleDriverLeaveRequest();
+	}
+	else
+	{
+		ServerDriverLeave();
+	}
 }
 
 bool AUTVehicleFlying::HandleDriverLeaveRequest()

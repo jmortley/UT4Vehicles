@@ -425,6 +425,10 @@ void AUTVehicle::BindDrivingInput()
 	}
 	if (BoundInputPC == PC && DrivingInputComponent != nullptr)
 	{
+		if (PC->MyHUD != nullptr)
+		{
+			PC->MyHUD->AddPostRenderedActor(this);
+		}
 		return;
 	}
 
@@ -441,7 +445,7 @@ void AUTVehicle::BindDrivingInput()
 		BoundInputPC = nullptr;
 		return;
 	}
-	DrivingInputComponent->Priority = 100;
+	DrivingInputComponent->Priority = 10000;
 	DrivingInputComponent->bBlockInput = false;
 	UInputComponent* IC = DrivingInputComponent;
 	IC->BindAxis("MoveForward", this, &AUTVehicle::OnThrottleInput);
@@ -470,11 +474,18 @@ void AUTVehicle::BindDrivingInput()
 	// Match UT3's use flow: the same stock, remappable ActivateSpecial action
 	// enters nearby vehicles and exits the currently possessed vehicle.
 	FInputActionBinding& ExitBinding = IC->BindAction(
-		"ActivateSpecial", IE_Pressed, this, &AUTVehicle::ServerDriverLeave);
+		"ActivateSpecial", IE_Pressed, this, &AUTVehicle::HandleActivateSpecialPressed);
 	ExitBinding.bConsumeInput = true;
 	BindVehicleSpecificInput(IC);
 	IC->RegisterComponent();
 	PC->PushInputComponent(IC);
+	if (PC->MyHUD != nullptr)
+	{
+		// Entry removes the nearby-vehicle PostRenderedActor registration when
+		// possession changes. Register the possessed pawn itself so vehicle health,
+		// exit, and Scorpion boost-eject prompts survive dedicated-client entry.
+		PC->MyHUD->AddPostRenderedActor(this);
+	}
 
 	int32 ForwardMappings = 0;
 	int32 BackwardMappings = 0;
@@ -499,6 +510,10 @@ void AUTVehicle::UnbindDrivingInput()
 	HandlePrimaryFireReleased();
 	HandleAltFireReleased();
 
+	if (BoundInputPC != nullptr && BoundInputPC->MyHUD != nullptr)
+	{
+		BoundInputPC->MyHUD->RemovePostRenderedActor(this);
+	}
 	if (BoundInputPC != nullptr && DrivingInputComponent != nullptr)
 	{
 		BoundInputPC->PopInputComponent(DrivingInputComponent);
@@ -763,6 +778,20 @@ void AUTVehicle::HandleAltFireReleased()
 	StopVehicleFire(1);
 }
 
+void AUTVehicle::HandleActivateSpecialPressed()
+{
+	UE_LOG(LogTemp, Warning, TEXT("[VehicleExit] ActivateSpecial pressed Vehicle=%s Role=%d Local=%d Controller=%s"),
+		*GetName(), (int32)Role, IsLocallyControlled() ? 1 : 0, *GetNameSafe(Controller));
+	if (Role == ROLE_Authority)
+	{
+		HandleDriverLeaveRequest();
+	}
+	else
+	{
+		ServerDriverLeave();
+	}
+}
+
 void AUTVehicle::BindVehicleSpecificInput(UInputComponent*)
 {
 }
@@ -879,6 +908,9 @@ bool AUTVehicle::ServerDriverLeave_Validate()
 
 void AUTVehicle::ServerDriverLeave_Implementation()
 {
+	UE_LOG(LogTemp, Warning, TEXT("[VehicleExit] Server request Vehicle=%s Controller=%s Driver=%s"),
+		*GetName(), *GetNameSafe(Controller),
+		*GetNameSafe(VehicleComponent != nullptr ? VehicleComponent->Driver : nullptr));
 	HandleDriverLeaveRequest();
 }
 

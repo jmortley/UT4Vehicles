@@ -170,6 +170,7 @@ AUTVehicle_Goliath::AUTVehicle_Goliath(const FObjectInitializer& ObjectInitializ
 	CannonMuzzleSocket = FName(TEXT("TurretFireSocket"));
 	CannonFireInterval = 2.5f;
 	bCannonFiring = false;
+	bSpawnParkingLocked = false;
 	NextCannonFireTime = -1000.0f;
 
 	GetMesh()->BodyInstance.COMNudge = FVector(-20.0f, 0.0f, -30.0f);
@@ -247,10 +248,19 @@ void AUTVehicle_Goliath::BeginPlay()
 			GetMesh()->PutAllRigidBodiesToSleep();
 			if (UUTVehicleMovementTank* Movement = Cast<UUTVehicleMovementTank>(GetVehicleMovementComponent()))
 			{
-				// An empty tank does not need PhysX suspension/drive updates. Keeping
-				// that component inactive also prevents client-side simulated proxies
-				// from inventing a different launch than the parked authority copy.
+				// Sleeping is not a parking lock: PhysX may wake the body later and a
+				// single bad suspension/depenetration step can cross the entire map
+				// before the next actor tick. Disable physical response and gravity on
+				// the untouched spawn while retaining query collision, so the nearby
+				// entry prompt and RPC still see the tank. Keeping the body simulated
+				// also preserves the already-created PhysX vehicle state for entry.
 				Movement->Deactivate();
+			}
+			if (FBodyInstance* ChassisBody = GetMesh()->GetBodyInstance())
+			{
+				ChassisBody->SetCollisionEnabled(ECollisionEnabled::QueryOnly);
+				GetMesh()->SetEnableGravity(false);
+				bSpawnParkingLocked = true;
 			}
 			UE_LOG(LogTemp, Warning, TEXT("[GoliathParking] Spawn parked Vehicle=%s GroundZ=%.2f ActorZ=%.2f Height=%.2f"),
 				*GetName(), GroundZ, ParkedActorZ, GetParkedHeightAboveGround());
@@ -321,6 +331,20 @@ void AUTVehicle_Goliath::UpdateVacantParking(float DeltaSeconds)
 	}
 	if (VehicleComponent->HasDriver())
 	{
+		if (bSpawnParkingLocked)
+		{
+			// Restore only the chassis body's physical response. Never recreate the
+			// skeletal or movement physics states here: doing so resurrects the
+			// imported turret/tread bodies that AUTVehicle deliberately strips out.
+			if (FBodyInstance* ChassisBody = GetMesh()->GetBodyInstance())
+			{
+				ChassisBody->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+			}
+			GetMesh()->SetEnableGravity(true);
+			bSpawnParkingLocked = false;
+			UE_LOG(LogTemp, Warning, TEXT("[GoliathParking] Spawn lock released Vehicle=%s Role=%d Physics=%d"),
+				*GetName(), (int32)Role, GetMesh()->IsSimulatingPhysics() ? 1 : 0);
+		}
 		if (!Movement->IsActive())
 		{
 			Movement->Activate(true);
@@ -328,6 +352,12 @@ void AUTVehicle_Goliath::UpdateVacantParking(float DeltaSeconds)
 			UE_LOG(LogTemp, Warning, TEXT("[GoliathParking] Drive enabled Vehicle=%s Role=%d"),
 				*GetName(), (int32)Role);
 		}
+		return;
+	}
+	if (bSpawnParkingLocked)
+	{
+		// The rigid chassis cannot accumulate gravity, collision, suspension, or
+		// replication wake-up impulses while this first-spawn lock is active.
 		return;
 	}
 

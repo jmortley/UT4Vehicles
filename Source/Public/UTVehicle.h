@@ -145,6 +145,7 @@ protected:
 	void HandlePrimaryFireReleased();
 	void HandleAltFirePressed();
 	void HandleAltFireReleased();
+	void HandleActivateSpecialPressed();
 	void ActivateVehicleCamera();
 	void DeactivateVehicleCamera();
 	void UpdateVehicleAudio(float DeltaSeconds);

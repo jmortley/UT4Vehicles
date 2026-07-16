@@ -91,6 +91,7 @@ protected:
 	void HandlePrimaryFireReleased();
 	void HandleAltFirePressed();
 	void HandleAltFireReleased();
+	void HandleActivateSpecialPressed();
 	void ApplyFlightInput();
 	void ActivateVehicleCamera();
 	void DeactivateVehicleCamera();

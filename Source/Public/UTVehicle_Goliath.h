@@ -64,6 +64,8 @@ protected:
 	FRotator GetCannonAimRotation() const;
 
 	bool bCannonFiring;
+	/** Hard physics-response lock used only before this spawn receives its first driver. */
+	bool bSpawnParkingLocked;
 	float NextCannonFireTime;
 	FTimerHandle CannonFireTimerHandle;
 };

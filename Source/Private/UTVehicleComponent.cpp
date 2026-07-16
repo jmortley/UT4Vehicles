@@ -390,7 +390,13 @@ void UUTVehicleComponent::UnbindEntryInput()
 {
 	if (EntryInputPC != nullptr && GetOwner() != nullptr && EntryInputPC->MyHUD != nullptr)
 	{
-		EntryInputPC->MyHUD->RemovePostRenderedActor(GetOwner());
+		// Possession can invalidate the nearby-entry capture after the vehicle has
+		// already registered itself as the occupied HUD actor. Do not let cleanup of
+		// the stale entry binding erase the driver's health/exit/eject HUD again.
+		if (EntryInputPC->GetPawn() != GetOwner())
+		{
+			EntryInputPC->MyHUD->RemovePostRenderedActor(GetOwner());
+		}
 	}
 	if (EntryInputPC != nullptr && EntryInputComponent != nullptr)
 	{
@@ -1038,17 +1044,9 @@ void UUTVehicleComponent::DrawVehicleHUD(AUTHUD* HUD, UCanvas* Canvas, APlayerCo
 	Canvas->TextSize(PromptFont, UsePrompt.ToString(), PromptWidth, PromptHeight);
 	const FVector2D PromptPosition((ScreenWidth - PromptWidth) * 0.5f,
 		ScreenHeight * (bShowEjectPrompt ? 0.58f : 0.68f));
-	const FLinearColor PromptColor = bShowEjectPrompt
-		? FLinearColor(1.0f, 0.18f, 0.03f, 1.0f)
-		: FLinearColor::White;
-	if (bShowEjectPrompt)
-	{
-		Canvas->SetDrawColor(0, 0, 0, 180);
-		Canvas->DrawTile(Canvas->DefaultTexture, PromptPosition.X - 16.0f,
-			PromptPosition.Y - 8.0f, PromptWidth + 32.0f, PromptHeight + 16.0f,
-			0.0f, 0.0f, 1.0f, 1.0f);
-	}
-	FCanvasTextItem PromptItem(PromptPosition, UsePrompt, PromptFont, PromptColor);
+	// UT3 and Blitz both use clean white announcement text rather than a colored
+	// widget. Size/position still make the time-sensitive eject prompt distinct.
+	FCanvasTextItem PromptItem(PromptPosition, UsePrompt, PromptFont, FLinearColor::White);
 	PromptItem.EnableShadow(FLinearColor::Black, FVector2D(1.0f, 2.0f));
 	Canvas->DrawItem(PromptItem);
 }

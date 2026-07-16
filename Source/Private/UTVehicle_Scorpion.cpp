@@ -96,9 +96,10 @@ namespace
 		Movement4W->TransmissionSetup.NeutralGearUpRatio = 0.15f;
 		Movement4W->TransmissionSetup.GearSwitchTime = 0.15f;
 		Movement4W->TransmissionSetup.GearAutoBoxLatency = 2.0f;
-		// 4:1 first gear x 2:1 final drive = 8:1 overall. A 45 cm wheel then
-		// reaches about 2350 uu/s at the 4000 RPM limiter.
-		Movement4W->TransmissionSetup.FinalRatio = 2.0f;
+		// Live PhysX telemetry with the nominal 8:1 setup settled at only 1590
+		// uu/s despite the intended 2300 target. A 1.4 final drive corrects the
+		// observed effective ratio while retaining the same one-gear curve.
+		Movement4W->TransmissionSetup.FinalRatio = 1.4f;
 		Movement4W->TransmissionSetup.ReverseGearRatio = -4.0f;
 		Movement4W->TransmissionSetup.ForwardGears.SetNum(1);
 		Movement4W->TransmissionSetup.ForwardGears[0].Ratio = 4.0f;
@@ -516,7 +517,15 @@ void AUTVehicle_Scorpion::OnAltFireReleased()
 
 bool AUTVehicle_Scorpion::HandleDriverLeaveRequest()
 {
-	if (Role == ROLE_Authority && ReadyToSelfDestruct())
+	const bool bReadyToEject = Role == ROLE_Authority && ReadyToSelfDestruct();
+	if (Role == ROLE_Authority)
+	{
+		UE_LOG(LogTemp, Warning, TEXT("[ScorpionEject] Request Vehicle=%s Active=%d Armed=%d Elapsed=%.3f Speed=%.1f Ready=%d"),
+			*GetName(), bBoostersActivated ? 1 : 0, bSelfDestructArmed ? 1 : 0,
+			GetWorld() != nullptr ? GetWorld()->GetTimeSeconds() - BoostStartTime : 0.0f,
+			GetVelocity().Size(), bReadyToEject ? 1 : 0);
+	}
+	if (bReadyToEject)
 	{
 		return ArmSelfDestructAndEject();
 	}
@@ -807,8 +816,7 @@ bool AUTVehicle_Scorpion::IsBoostEjectReady() const
 {
 	return GetWorld() != nullptr && VehicleComponent != nullptr &&
 		VehicleComponent->HasDriver() && !VehicleComponent->bDead && bBoostersActivated &&
-		!bSelfDestructArmed && GetWorld()->GetTimeSeconds() - BoostStartTime >= SelfDestructMinBoostTime &&
-		GetVelocity().Size() >= SelfDestructMinSpeed;
+		!bSelfDestructArmed;
 }
 
 bool AUTVehicle_Scorpion::ShouldShowBoostEjectPrompt() const
