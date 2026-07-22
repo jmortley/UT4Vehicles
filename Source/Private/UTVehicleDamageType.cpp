@@ -46,6 +46,13 @@ float UUTDmgType_TankShell::GetVehicleDamageScalingFor(const UUTVehicleComponent
 	return Vehicle != nullptr && Vehicle->bLightArmor ? 1.2f : VehicleDamageScaling;
 }
 
+UUTDmgType_ScorpionGlob::UUTDmgType_ScorpionGlob(const FObjectInitializer& ObjectInitializer)
+	: Super(ObjectInitializer)
+{
+	VehicleDamageScaling = 0.75f;
+	bCausesBlood = false;
+}
+
 UUTDmgType_ScorpionSelfDestruct::UUTDmgType_ScorpionSelfDestruct(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
 {

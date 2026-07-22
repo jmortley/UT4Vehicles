@@ -19,8 +19,20 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Vehicle)
 	float VisualWheelCenterOffsetZ;
 
+	/** Optional actor-space yaw root driven by the owning vehicle's replicated aim. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Vehicle|Weapon")
+	FName WeaponYawBoneName;
+
+	/** Optional local-space pitch root driven by the owning vehicle's replicated aim. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Vehicle|Weapon")
+	FName WeaponPitchBoneName;
+
+	/** Set the local turret aim that will be applied after normal animation evaluation. */
+	void SetWeaponAimRotation(const FRotator& NewAimRotation);
+
 	virtual void RefreshBoneTransforms(FActorComponentTickFunction* TickFunction = nullptr) override;
 
 private:
+	FRotator WeaponAimRotation;
 	bool bLoggedActiveWheelPose;
 };

@@ -2,6 +2,9 @@
 #include "UTVehicleDamageType.h"
 #include "Components/StaticMeshComponent.h"
 #include "Engine/StaticMesh.h"
+#include "Kismet/GameplayStatics.h"
+#include "Particles/ParticleSystem.h"
+#include "Particles/ParticleSystemComponent.h"
 #include "UObject/ConstructorHelpers.h"
 
 AUTProj_TankShell::AUTProj_TankShell(const FObjectInitializer& ObjectInitializer)
@@ -24,6 +27,19 @@ AUTProj_TankShell::AUTProj_TankShell(const FObjectInitializer& ObjectInitializer
 		ShellMesh->SetStaticMesh(ShellMeshFinder.Object);
 	}
 
+	FlightEffectComponent = CreateDefaultSubobject<UParticleSystemComponent>(TEXT("FlightEffect"));
+	FlightEffectComponent->SetupAttachment(RootComponent);
+	FlightEffectComponent->bAutoActivate = true;
+	static ConstructorHelpers::FObjectFinder<UParticleSystem> FlightEffectFinder(
+		TEXT("/Game/RestrictedAssets/Weapons/RocketLauncher/P_RocketGrenade_Trail"));
+	if (FlightEffectFinder.Succeeded())
+	{
+		FlightEffectComponent->SetTemplate(FlightEffectFinder.Object);
+	}
+	static ConstructorHelpers::FObjectFinder<UParticleSystem> ImpactEffectFinder(
+		TEXT("/Game/RestrictedAssets/Weapons/RocketLauncher/VFX/Particles/P_Rocket_Explo_Base"));
+	ImpactEffect = ImpactEffectFinder.Object;
+
 	if (ProjectileMovement != nullptr)
 	{
 		ProjectileMovement->InitialSpeed = 15000.0f;
@@ -33,7 +49,9 @@ AUTProj_TankShell::AUTProj_TankShell(const FObjectInitializer& ObjectInitializer
 		ProjectileMovement->bShouldBounce = false;
 	}
 
-	DamageParams.BaseDamage = 360.0f;
+	// Deliberate UT4 balance override: the UT3 shell was 360. A 340-point
+	// center hit lets a fully stacked 399-effective-health player barely live.
+	DamageParams.BaseDamage = 340.0f;
 	DamageParams.MinimumDamage = 0.0f;
 	DamageParams.InnerRadius = 0.0f;
 	DamageParams.OuterRadius = 600.0f;
@@ -44,4 +62,16 @@ AUTProj_TankShell::AUTProj_TankShell(const FObjectInitializer& ObjectInitializer
 	bCanHitInstigator = false;
 	bDamageOnBounce = true;
 	bReplicateUTMovement = true;
+}
+
+void AUTProj_TankShell::Explode_Implementation(const FVector& HitLocation,
+	const FVector& HitNormal, UPrimitiveComponent* HitComp)
+{
+	if (!bExploded && GetWorld() != nullptr && GetWorld()->GetNetMode() != NM_DedicatedServer &&
+		ImpactEffect != nullptr)
+	{
+		UGameplayStatics::SpawnEmitterAtLocation(GetWorld(), ImpactEffect, HitLocation,
+			HitNormal.Rotation(), true);
+	}
+	Super::Explode_Implementation(HitLocation, HitNormal, HitComp);
 }

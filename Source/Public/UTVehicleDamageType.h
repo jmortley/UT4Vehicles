@@ -62,6 +62,13 @@ public:
 	virtual float GetVehicleDamageScalingFor(const UUTVehicleComponent* Vehicle) const override;
 };
 
+/** UT3 Scorpion glob: reduced vehicle damage and no blood presentation. */
+UCLASS(Blueprintable)
+class UTVEHICLES_API UUTDmgType_ScorpionGlob : public UUTVehicleDamageType
+{
+	GENERATED_UCLASS_BODY()
+};
+
 /** UT3 Scorpion self-destruct replaces any positive vehicle hit with exactly 610 damage. */
 UCLASS(Blueprintable)
 class UTVEHICLES_API UUTDmgType_ScorpionSelfDestruct : public UUTVehicleDamageType

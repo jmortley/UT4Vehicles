@@ -131,12 +131,12 @@ AUTVehicle_Raptor::AUTVehicle_Raptor(const FObjectInitializer& ObjectInitializer
 	}
 
 	// UT3 Raptor reference: AirSpeed=2500, forces 750 forward / 100 reverse /
-	// 450 strafe / 500 rise, with 0.7 Long/Lat/Up damping. This kinematic port
-	// preserves those ratios and derives forward acceleration from the desired
-	// terminal speed (2500 * 0.7), giving the same asymptotic acceleration shape.
+	// 450 strafe / 500 rise, with 0.7 Long/Lat/Up damping. This variant raises
+	// flight speed by 30 percent while preserving those force ratios and the same
+	// asymptotic acceleration shape.
 	if (HoverMovement != nullptr)
 	{
-		HoverMovement->MaxSpeed = 2500.0f;
+		HoverMovement->MaxSpeed = 3250.0f;
 		HoverMovement->MaxAltitude = 5000.0f;
 		const float UT3ForceScale = (HoverMovement->MaxSpeed * 0.7f) / 750.0f;
 		HoverMovement->ThrustForce = 750.0f * UT3ForceScale;

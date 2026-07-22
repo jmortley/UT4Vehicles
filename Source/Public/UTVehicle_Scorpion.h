@@ -4,6 +4,11 @@
 #include "VehicleWheel.h"
 #include "UTVehicle_Scorpion.generated.h"
 
+class UParticleSystem;
+class UStaticMesh;
+class USoundBase;
+class AUTProj_ScorpionGlob;
+
 /**
  * UT3 Scorpion - 4-wheeled ground vehicle with rear-wheel drive.
  * Uses SK_VH_Scorpion_001 skeletal mesh from UT3 assets.
@@ -66,6 +71,25 @@ public:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Scorpion|Boost")
 	float BoostAcceleration;
 
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Scorpion|Gun")
+	TSubclassOf<AUTProj_ScorpionGlob> GunProjectileClass;
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Scorpion|Gun")
+	FName GunMuzzleSocket;
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Scorpion|Gun")
+	float GunFireInterval;
+
+	/** Fast visual tracking with interpolation between replicated aim packets. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Scorpion|Gun")
+	float GunAimRotationRate;
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Scorpion|Gun")
+	UParticleSystem* GunMuzzleEffect;
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Scorpion|Gun")
+	USoundBase* GunFireSound;
+
 	/** UT3 Scorpion takes 50% more damage while its ordinary boost is active. */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Scorpion|Boost")
 	float BoostDamageMultiplier;
@@ -124,6 +148,29 @@ public:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Scorpion|Self Destruct")
 	float SelfDestructMomentum;
 
+	/** Original UT3 boost-eject explosion, imported into the UT4 content tree. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Scorpion|Self Destruct")
+	UParticleSystem* SelfDestructEffect;
+
+	/** Locally simulated hatch debris spawned for the boost-eject explosion. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Scorpion|Self Destruct")
+	UStaticMesh* SelfDestructCanopyMesh;
+
+	/** Imported UT3 skeleton bone at the center of the detachable hatch. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Scorpion|Self Destruct")
+	FName SelfDestructCanopyBone;
+
+	/** Hatch launch velocity in the Scorpion mesh's local coordinate space. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Scorpion|Self Destruct")
+	FVector SelfDestructCanopyLaunchVelocity;
+
+	/** Hatch angular velocity in the Scorpion mesh's local coordinate space. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Scorpion|Self Destruct")
+	FVector SelfDestructCanopyAngularVelocity;
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Scorpion|Self Destruct")
+	float SelfDestructCanopyLifetime;
+
 	/** An armed, driverless Scorpion takes double damage so it can be intercepted. */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Scorpion|Self Destruct")
 	float ArmedDamageMultiplier;
@@ -138,6 +185,8 @@ protected:
 	virtual void OnThrottleInput(float Value) override;
 	virtual void OnHandbrakePressed() override;
 	virtual void OnHandbrakeReleased() override;
+	virtual void OnPrimaryFirePressed() override;
+	virtual void OnPrimaryFireReleased() override;
 	virtual void OnAltFirePressed() override;
 	virtual void OnAltFireReleased() override;
 	virtual bool HandleDriverLeaveRequest() override;
@@ -145,6 +194,12 @@ protected:
 
 	UFUNCTION(Reliable, Server, WithValidation)
 	void ServerSetBladesExtended(bool bExtended);
+
+	UFUNCTION(Reliable, Server, WithValidation)
+	void ServerSetGunFiring(bool bNewFiring, FRotator NewAimRotation);
+
+	UFUNCTION(Unreliable, Server, WithValidation)
+	void ServerSetGunAim(FRotator NewAimRotation);
 
 	UFUNCTION(Reliable, Server, WithValidation)
 	void ServerStartBoost();
@@ -163,10 +218,28 @@ protected:
 	void OnRep_SelfDestructArmed();
 
 	UFUNCTION()
+	void OnRep_GunAim();
+
+	UFUNCTION(Unreliable, NetMulticast)
+	void MulticastPlayGunFire(FVector MuzzleLocation, FRotator MuzzleRotation);
+
+	/** Play the one-shot destruction presentation on every relevant client. */
+	UFUNCTION(Reliable, NetMulticast)
+	void MulticastPlaySelfDestructEffects(FVector EffectLocation, FRotator EffectRotation,
+		FVector CanopyLocation, FRotator CanopyRotation, FVector InheritedVelocity);
+
+	UFUNCTION()
 	void OnArmedVehicleHit(UPrimitiveComponent* HitComponent, AActor* OtherActor,
 		UPrimitiveComponent* OtherComponent, FVector NormalImpulse, const FHitResult& Hit);
 
 	void SetBladesExtended(bool bExtended);
+	void SetGunFiring(bool bNewFiring);
+	void FireGun();
+	void UpdateGunAim(float DeltaSeconds);
+	FRotator GetDesiredGunAimRotation() const;
+	FRotator GetGunAimRotation() const;
+	FRotator GetAdjustedProjectileAimRotation() const;
+	FRotator SanitizeGunAim(const FRotator& AimRotation) const;
 	void RefreshBladeVisuals();
 	void UpdateBladeTraces();
 	void TraceBlade(bool bLeftBlade, const FVector& PreviousStart, const FVector& PreviousEnd,
@@ -189,10 +262,18 @@ protected:
 
 	float BoostStartTime;
 	float NextBoostTime;
+	float NextGunFireTime;
+	float LastGunAimSendTime;
 	float NormalDriveThrottle;
 	float LastSentNormalDriveThrottle;
 	bool bHavePreviousBladePositions;
 	bool bHasSelfDestructed;
+	bool bGunFiring;
+	FRotator CurrentGunAim;
+	FRotator LastSentGunAim;
+
+	UPROPERTY(ReplicatedUsing = OnRep_GunAim)
+	FRotator ReplicatedGunAim;
 	FVector PreviousLeftBladeStart;
 	FVector PreviousLeftBladeEnd;
 	FVector PreviousRightBladeStart;
@@ -203,6 +284,7 @@ protected:
 
 	FTimerHandle BoostTimerHandle;
 	FTimerHandle SelfDestructTimerHandle;
+	FTimerHandle GunFireTimerHandle;
 };
 
 /** Front wheel for Scorpion - steerable, no handbrake */

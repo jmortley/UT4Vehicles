@@ -4,6 +4,7 @@
 #include "UTVehicleComponent.h"
 #include "UTVehicleDamageType.h"
 #include "UTVehicleMeshComponent.h"
+#include "UTProj_ScorpionGlob.h"
 #include "UTGameplayStatics.h"
 #include "UnrealNetwork.h"
 #include "PhysicsEngine/BodySetup.h"
@@ -13,7 +14,12 @@
 #include "Sound/SoundWave.h"
 #include "Camera/CameraActor.h"
 #include "Camera/CameraComponent.h"
+#include "Components/StaticMeshComponent.h"
+#include "Engine/StaticMesh.h"
+#include "Engine/StaticMeshActor.h"
 #include "GameFramework/SpringArmComponent.h"
+#include "Kismet/GameplayStatics.h"
+#include "Particles/ParticleSystem.h"
 
 namespace
 {
@@ -25,6 +31,8 @@ namespace
 			// wheel shape is 45 uu. Match the visible hub to the physical contact
 			// patch without changing suspension, gearing, or traction.
 			VehicleMesh->VisualWheelCenterOffsetZ = 20.0f;
+			VehicleMesh->WeaponYawBoneName = FName(TEXT("gun_rotate"));
+			VehicleMesh->WeaponPitchBoneName = FName(TEXT("gun_rotate"));
 		}
 
 		// The supplied folder has no runnable Scorpion BP. Copy the powertrain
@@ -141,14 +149,15 @@ namespace
 
 		FRichCurve* SteeringCurve = Movement4W->SteeringCurve.GetRichCurve();
 		SteeringCurve->Reset();
-		// UE4's curve input is km/h. These are the original UT3 Scorpion steering
-		// angles with the speed axis doubled for the new 2300 uu/s UT4 target.
+		// UE4's curve input is km/h. Keep high-speed and boost steering at exactly
+		// 90 percent of the low-speed response: 0.54 versus 0.60. Ease into that
+		// small reduction so steering never becomes more responsive as speed rises.
 		SteeringCurve->AddKey(0.0f, 0.60f);
-		SteeringCurve->AddKey(15.0f, 0.48f);
-		SteeringCurve->AddKey(43.2f, 0.28f);
-		SteeringCurve->AddKey(79.2f, 0.222f);
-		SteeringCurve->AddKey(93.6f, 0.133f);
-		SteeringCurve->AddKey(115.2f, 0.022f);
+		SteeringCurve->AddKey(15.0f, 0.60f);
+		SteeringCurve->AddKey(43.2f, 0.58f);
+		SteeringCurve->AddKey(79.2f, 0.55f);
+		SteeringCurve->AddKey(90.0f, 0.54f);
+		SteeringCurve->AddKey(158.4f, 0.54f);
 	}
 }
 
@@ -171,6 +180,16 @@ AUTVehicle_Scorpion::AUTVehicle_Scorpion(const FObjectInitializer& ObjectInitial
 	BoostRechargeDuration = 5.0f;
 	BoostTargetSpeed = 4400.0f;
 	BoostAcceleration = 8500.0f;
+	GunProjectileClass = AUTProj_ScorpionGlob::StaticClass();
+	GunMuzzleSocket = FName(TEXT("TurretFireSocket"));
+	GunFireInterval = 0.65f;
+	GunAimRotationRate = 360.0f;
+	static ConstructorHelpers::FObjectFinder<UParticleSystem> GunMuzzleEffectFinder(
+		TEXT("/Game/RestrictedAssets/Weapons/LinkGun/Effects/P_FX_LinkGun_MF_Primary"));
+	GunMuzzleEffect = GunMuzzleEffectFinder.Object;
+	static ConstructorHelpers::FObjectFinder<USoundBase> GunFireSoundFinder(
+		TEXT("/Game/Mogno/Vehicles/ScorpionTest/SFX/A_Vehicle_Scorpion_AltFire01"));
+	GunFireSound = GunFireSoundFinder.Object;
 	BoostDamageMultiplier = 1.5f;
 	GroundDownforceAcceleration = 3200.0f;
 	GroundDownforceTargetSpeed = 1800.0f;
@@ -189,13 +208,23 @@ AUTVehicle_Scorpion::AUTVehicle_Scorpion(const FObjectInitializer& ObjectInitial
 	SelfDestructDamage = 600.0f;
 	SelfDestructRadius = 600.0f;
 	SelfDestructMomentum = 200000.0f;
+	SelfDestructCanopyBone = FName(TEXT("Hatch_Slide"));
+	SelfDestructCanopyLaunchVelocity = FVector(250.0f, 0.0f, 900.0f);
+	SelfDestructCanopyAngularVelocity = FVector(180.0f, 420.0f, 260.0f);
+	SelfDestructCanopyLifetime = 6.0f;
 	ArmedDamageMultiplier = 2.0f;
 	BoostStartTime = -1000.0f;
 	NextBoostTime = -1000.0f;
+	NextGunFireTime = -1000.0f;
+	LastGunAimSendTime = -1000.0f;
 	NormalDriveThrottle = 0.0f;
 	LastSentNormalDriveThrottle = 0.0f;
 	bHavePreviousBladePositions = false;
 	bHasSelfDestructed = false;
+	bGunFiring = false;
+	ReplicatedGunAim = FRotator::ZeroRotator;
+	CurrentGunAim = FRotator::ZeroRotator;
+	LastSentGunAim = FRotator::ZeroRotator;
 	SelfDestructInstigator = nullptr;
 
 	// Mesh setup
@@ -211,6 +240,12 @@ AUTVehicle_Scorpion::AUTVehicle_Scorpion(const FObjectInitializer& ObjectInitial
 	{
 		GetMesh()->SetMaterial(0, MatFinder.Object);
 	}
+	static ConstructorHelpers::FObjectFinder<UParticleSystem> SelfDestructEffectFinder(
+		TEXT("/Game/RestrictedAssets/Proto/UT3_Vehicles/VH_Scorpion/Effects/P_VH_Scorpion_SelfDestruct"));
+	SelfDestructEffect = SelfDestructEffectFinder.Object;
+	static ConstructorHelpers::FObjectFinder<UStaticMesh> SelfDestructCanopyFinder(
+		TEXT("/Game/RestrictedAssets/Proto/UT3_Vehicles/VH_Scorpion/Meshes/S_FX_ScorpionCanopy"));
+	SelfDestructCanopyMesh = SelfDestructCanopyFinder.Object;
 
 	// Vehicle component setup
 	if (VehicleComponent != nullptr)
@@ -230,6 +265,10 @@ AUTVehicle_Scorpion::AUTVehicle_Scorpion(const FObjectInitializer& ObjectInitial
 		SpringArm->SetRelativeLocation(FVector(75.0f, 0.0f, 475.0f));
 		SpringArm->SetRelativeRotation(FRotator(-7.0f, 0.0f, 0.0f));
 		SpringArm->TargetOffset = FVector::ZeroVector;
+		SpringArm->bUsePawnControlRotation = true;
+		SpringArm->bInheritPitch = true;
+		SpringArm->bInheritYaw = true;
+		SpringArm->bInheritRoll = false;
 		SpringArm->bEnableCameraLag = true;
 		SpringArm->CameraLagSpeed = 8.0f;
 	}
@@ -291,6 +330,10 @@ void AUTVehicle_Scorpion::PostInitializeComponents()
 		SpringArm->SetRelativeLocation(FVector(75.0f, 0.0f, 475.0f));
 		SpringArm->SetRelativeRotation(FRotator(-7.0f, 0.0f, 0.0f));
 		SpringArm->TargetOffset = FVector::ZeroVector;
+		SpringArm->bUsePawnControlRotation = true;
+		SpringArm->bInheritPitch = true;
+		SpringArm->bInheritYaw = true;
+		SpringArm->bInheritRoll = false;
 		SpringArm->bEnableCameraLag = true;
 		SpringArm->CameraLagSpeed = 8.0f;
 	}
@@ -344,6 +387,7 @@ void AUTVehicle_Scorpion::PostInitializeComponents()
 void AUTVehicle_Scorpion::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
+	UpdateGunAim(DeltaSeconds);
 
 	// Wheeled physics runs on the server and on the locally controlled proxy.
 	// Simulated proxies receive the resulting replicated transform and must not
@@ -470,6 +514,7 @@ void AUTVehicle_Scorpion::EndPlay(const EEndPlayReason::Type EndPlayReason)
 	{
 		GetWorldTimerManager().ClearTimer(BoostTimerHandle);
 		GetWorldTimerManager().ClearTimer(SelfDestructTimerHandle);
+		GetWorldTimerManager().ClearTimer(GunFireTimerHandle);
 	}
 	if (GetMesh() != nullptr)
 	{
@@ -487,6 +532,82 @@ void AUTVehicle_Scorpion::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& 
 	DOREPLIFETIME(AUTVehicle_Scorpion, bRightBladeBroken);
 	DOREPLIFETIME(AUTVehicle_Scorpion, bBoostersActivated);
 	DOREPLIFETIME(AUTVehicle_Scorpion, bSelfDestructArmed);
+	DOREPLIFETIME_CONDITION(AUTVehicle_Scorpion, ReplicatedGunAim, COND_SkipOwner);
+}
+
+FRotator AUTVehicle_Scorpion::SanitizeGunAim(const FRotator& AimRotation) const
+{
+	FRotator Result;
+	Result.Pitch = FMath::Clamp(FRotator::NormalizeAxis(AimRotation.Pitch), -15.0f, 65.0f);
+	Result.Yaw = FRotator::NormalizeAxis(AimRotation.Yaw);
+	Result.Roll = 0.0f;
+	return Result;
+}
+
+FRotator AUTVehicle_Scorpion::GetDesiredGunAimRotation() const
+{
+	const FRotator WorldAim = Controller != nullptr
+		? Controller->GetControlRotation()
+		: GetActorRotation();
+	const USkeletalMeshComponent* Mesh = GetMesh();
+	if (Mesh == nullptr)
+	{
+		return SanitizeGunAim(WorldAim - GetActorRotation());
+	}
+	const FVector LocalAimDirection = Mesh->GetComponentTransform().InverseTransformVectorNoScale(
+		WorldAim.Vector());
+	return SanitizeGunAim(LocalAimDirection.Rotation());
+}
+
+void AUTVehicle_Scorpion::UpdateGunAim(float DeltaSeconds)
+{
+	const bool bOccupied = VehicleComponent != nullptr && VehicleComponent->HasDriver() &&
+		!VehicleComponent->bDead;
+	if (bOccupied && IsLocallyControlled())
+	{
+		const FRotator DesiredAim = GetDesiredGunAimRotation();
+		ReplicatedGunAim = DesiredAim;
+		if (Role < ROLE_Authority && GetWorld() != nullptr)
+		{
+			const float Now = GetWorld()->GetTimeSeconds();
+			const bool bAimChanged =
+				FMath::Abs(FMath::FindDeltaAngleDegrees(LastSentGunAim.Yaw, DesiredAim.Yaw)) >= 0.25f ||
+				FMath::Abs(FMath::FindDeltaAngleDegrees(LastSentGunAim.Pitch, DesiredAim.Pitch)) >= 0.25f;
+			if (bAimChanged && Now - LastGunAimSendTime >= 0.05f)
+			{
+				LastSentGunAim = DesiredAim;
+				LastGunAimSendTime = Now;
+				ServerSetGunAim(DesiredAim);
+			}
+		}
+	}
+
+	CurrentGunAim = FMath::RInterpConstantTo(CurrentGunAim,
+		SanitizeGunAim(ReplicatedGunAim), DeltaSeconds, GunAimRotationRate);
+	if (UUTVehicleMeshComponent* VehicleMesh = Cast<UUTVehicleMeshComponent>(GetMesh()))
+	{
+		VehicleMesh->SetWeaponAimRotation(CurrentGunAim);
+	}
+}
+
+bool AUTVehicle_Scorpion::ServerSetGunAim_Validate(FRotator NewAimRotation)
+{
+	return FMath::IsFinite(NewAimRotation.Pitch) && FMath::IsFinite(NewAimRotation.Yaw) &&
+		FMath::IsFinite(NewAimRotation.Roll);
+}
+
+void AUTVehicle_Scorpion::ServerSetGunAim_Implementation(FRotator NewAimRotation)
+{
+	if (VehicleComponent != nullptr && VehicleComponent->HasDriver() && !VehicleComponent->bDead)
+	{
+		ReplicatedGunAim = SanitizeGunAim(NewAimRotation);
+		ForceNetUpdate();
+	}
+}
+
+void AUTVehicle_Scorpion::OnRep_GunAim()
+{
+	ReplicatedGunAim = SanitizeGunAim(ReplicatedGunAim);
 }
 
 void AUTVehicle_Scorpion::OnThrottleInput(float Value)
@@ -523,6 +644,151 @@ void AUTVehicle_Scorpion::OnHandbrakeReleased()
 	Super::OnHandbrakeReleased();
 }
 
+void AUTVehicle_Scorpion::OnPrimaryFirePressed()
+{
+	if (Role == ROLE_Authority)
+	{
+		ReplicatedGunAim = GetDesiredGunAimRotation();
+		SetGunFiring(true);
+	}
+	else
+	{
+		ServerSetGunFiring(true, GetDesiredGunAimRotation());
+	}
+}
+
+void AUTVehicle_Scorpion::OnPrimaryFireReleased()
+{
+	if (Role == ROLE_Authority)
+	{
+		ReplicatedGunAim = GetDesiredGunAimRotation();
+		SetGunFiring(false);
+	}
+	else
+	{
+		ServerSetGunFiring(false, GetDesiredGunAimRotation());
+	}
+}
+
+bool AUTVehicle_Scorpion::ServerSetGunFiring_Validate(bool, FRotator NewAimRotation)
+{
+	return FMath::IsFinite(NewAimRotation.Pitch) && FMath::IsFinite(NewAimRotation.Yaw) &&
+		FMath::IsFinite(NewAimRotation.Roll);
+}
+
+void AUTVehicle_Scorpion::ServerSetGunFiring_Implementation(bool bNewFiring,
+	FRotator NewAimRotation)
+{
+	ReplicatedGunAim = SanitizeGunAim(NewAimRotation);
+	SetGunFiring(bNewFiring);
+}
+
+void AUTVehicle_Scorpion::SetGunFiring(bool bNewFiring)
+{
+	if (Role != ROLE_Authority)
+	{
+		return;
+	}
+	bGunFiring = bNewFiring && VehicleComponent != nullptr &&
+		VehicleComponent->HasDriver() && !VehicleComponent->bDead;
+	if (GetWorld() != nullptr)
+	{
+		GetWorldTimerManager().ClearTimer(GunFireTimerHandle);
+	}
+	if (bGunFiring)
+	{
+		FireGun();
+	}
+}
+
+FRotator AUTVehicle_Scorpion::GetGunAimRotation() const
+{
+	const USkeletalMeshComponent* Mesh = GetMesh();
+	const FRotator ProjectileAim = SanitizeGunAim(ReplicatedGunAim);
+	const FVector WorldAimDirection = Mesh != nullptr
+		? Mesh->GetComponentTransform().TransformVectorNoScale(ProjectileAim.Vector())
+		: GetActorTransform().TransformVectorNoScale(ProjectileAim.Vector());
+	return WorldAimDirection.Rotation();
+}
+
+FRotator AUTVehicle_Scorpion::GetAdjustedProjectileAimRotation() const
+{
+	FRotator AdjustedAim = GetGunAimRotation();
+	const float LocalPitch = SanitizeGunAim(ReplicatedGunAim).Pitch;
+	// UT3 nudges player-fired globs upward to compensate for their falling arc.
+	AdjustedAim.Pitch += LocalPitch >= 0.0f ? (90.0f - LocalPitch) / 16.0f : 5.625f;
+	AdjustedAim.Roll = 0.0f;
+	return AdjustedAim;
+}
+
+void AUTVehicle_Scorpion::FireGun()
+{
+	if (Role != ROLE_Authority || GetWorld() == nullptr || !bGunFiring ||
+		VehicleComponent == nullptr || !VehicleComponent->HasDriver() || VehicleComponent->bDead)
+	{
+		SetGunFiring(false);
+		return;
+	}
+
+	const float Now = GetWorld()->GetTimeSeconds();
+	if (Now < NextGunFireTime)
+	{
+		GetWorldTimerManager().SetTimer(GunFireTimerHandle, this,
+			&AUTVehicle_Scorpion::FireGun, NextGunFireTime - Now, false);
+		return;
+	}
+
+	USkeletalMeshComponent* Mesh = GetMesh();
+	FVector SpawnLocation = GetActorLocation() + GetActorForwardVector() * 220.0f +
+		FVector(0.0f, 0.0f, 120.0f);
+	if (Mesh != nullptr && Mesh->DoesSocketExist(GunMuzzleSocket))
+	{
+		SpawnLocation = Mesh->GetSocketLocation(GunMuzzleSocket);
+	}
+	const FRotator SpawnRotation = GetAdjustedProjectileAimRotation();
+
+	FActorSpawnParameters SpawnParameters;
+	SpawnParameters.Owner = this;
+	SpawnParameters.Instigator = this;
+	SpawnParameters.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+	UClass* ProjectileClass = GunProjectileClass.Get() != nullptr
+		? GunProjectileClass.Get()
+		: AUTProj_ScorpionGlob::StaticClass();
+	AUTProj_ScorpionGlob* Glob = GetWorld()->SpawnActor<AUTProj_ScorpionGlob>(
+		ProjectileClass, SpawnLocation, SpawnRotation, SpawnParameters);
+	if (Glob != nullptr)
+	{
+		Glob->InstigatorController = Controller != nullptr
+			? Controller
+			: VehicleComponent->DamageInstigator;
+		Glob->InstigatorTeamNum = GetTeamNum();
+		MulticastPlayGunFire(SpawnLocation, SpawnRotation);
+	}
+
+	NextGunFireTime = Now + GunFireInterval;
+	GetWorldTimerManager().SetTimer(GunFireTimerHandle, this,
+		&AUTVehicle_Scorpion::FireGun, GunFireInterval, false);
+}
+
+void AUTVehicle_Scorpion::MulticastPlayGunFire_Implementation(
+	FVector MuzzleLocation, FRotator MuzzleRotation)
+{
+	if (GetWorld() == nullptr || GetWorld()->GetNetMode() == NM_DedicatedServer)
+	{
+		return;
+	}
+	if (GunMuzzleEffect != nullptr)
+	{
+		UGameplayStatics::SpawnEmitterAtLocation(GetWorld(), GunMuzzleEffect,
+			MuzzleLocation, MuzzleRotation, true);
+	}
+	if (GunFireSound != nullptr)
+	{
+		UGameplayStatics::PlaySoundAtLocation(this, GunFireSound, MuzzleLocation,
+			1.0f, 1.0f, 0.0f, VehicleSoundAttenuation);
+	}
+}
+
 void AUTVehicle_Scorpion::OnAltFirePressed()
 {
 	if (Role == ROLE_Authority)
@@ -553,6 +819,7 @@ bool AUTVehicle_Scorpion::HandleDriverLeaveRequest()
 	{
 		// Never carry the previous driver's held-throttle state into the next seat.
 		NormalDriveThrottle = 0.0f;
+		SetGunFiring(false);
 	}
 	const bool bReadyToEject = Role == ROLE_Authority && ReadyToSelfDestruct();
 	if (Role == ROLE_Authority)
@@ -988,6 +1255,63 @@ void AUTVehicle_Scorpion::SelfDestructTimerExpired()
 	SelfDestruct(nullptr);
 }
 
+void AUTVehicle_Scorpion::MulticastPlaySelfDestructEffects_Implementation(
+	FVector EffectLocation, FRotator EffectRotation, FVector CanopyLocation,
+	FRotator CanopyRotation, FVector InheritedVelocity)
+{
+	UWorld* World = GetWorld();
+	if (World == nullptr || World->GetNetMode() == NM_DedicatedServer)
+	{
+		return;
+	}
+
+	if (SelfDestructEffect != nullptr)
+	{
+		UGameplayStatics::SpawnEmitterAtLocation(World, SelfDestructEffect,
+			EffectLocation, EffectRotation, true);
+	}
+
+	if (SelfDestructCanopyMesh == nullptr)
+	{
+		return;
+	}
+
+	FActorSpawnParameters SpawnParameters;
+	SpawnParameters.Owner = this;
+	SpawnParameters.Instigator = this;
+	SpawnParameters.ObjectFlags |= RF_Transient;
+	SpawnParameters.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+	AStaticMeshActor* CanopyActor = World->SpawnActor<AStaticMeshActor>(
+		AStaticMeshActor::StaticClass(), CanopyLocation, CanopyRotation, SpawnParameters);
+	if (CanopyActor == nullptr)
+	{
+		return;
+	}
+
+	// The multicast is the replication mechanism. Keep the short-lived debris
+	// local so it consumes no replicated actor or movement bandwidth.
+	CanopyActor->SetReplicates(false);
+	CanopyActor->SetMobility(EComponentMobility::Movable);
+	CanopyActor->SetLifeSpan(SelfDestructCanopyLifetime);
+	UStaticMeshComponent* CanopyComponent = CanopyActor->GetStaticMeshComponent();
+	if (CanopyComponent != nullptr)
+	{
+		CanopyComponent->SetStaticMesh(SelfDestructCanopyMesh);
+		CanopyComponent->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
+		CanopyComponent->SetCollisionObjectType(ECC_PhysicsBody);
+		CanopyComponent->SetCollisionResponseToAllChannels(ECR_Ignore);
+		CanopyComponent->SetCollisionResponseToChannel(ECC_WorldStatic, ECR_Block);
+		CanopyComponent->SetCollisionResponseToChannel(ECC_WorldDynamic, ECR_Block);
+		CanopyComponent->SetSimulatePhysics(true);
+
+		const FQuat LaunchRotation = EffectRotation.Quaternion();
+		CanopyComponent->SetPhysicsLinearVelocity(InheritedVelocity +
+			LaunchRotation.RotateVector(SelfDestructCanopyLaunchVelocity), false);
+		CanopyComponent->SetPhysicsAngularVelocity(
+			LaunchRotation.RotateVector(SelfDestructCanopyAngularVelocity), false);
+	}
+}
+
 void AUTVehicle_Scorpion::SelfDestruct(AActor* ImpactedActor)
 {
 	if (Role != ROLE_Authority || bHasSelfDestructed)
@@ -1003,6 +1327,22 @@ void AUTVehicle_Scorpion::SelfDestruct(AActor* ImpactedActor)
 		? SelfDestructInstigator
 		: GetVehicleDamageInstigator();
 	const FVector Origin = GetActorLocation();
+	const FVector InheritedVelocity = GetVelocity();
+	FRotator EffectRotation = GetActorRotation();
+	FVector CanopyLocation = Origin;
+	FRotator CanopyRotation = EffectRotation;
+	USkeletalMeshComponent* ScorpionMesh = GetMesh();
+	if (ScorpionMesh != nullptr)
+	{
+		EffectRotation = ScorpionMesh->GetComponentRotation();
+		if (ScorpionMesh->GetBoneIndex(SelfDestructCanopyBone) != INDEX_NONE)
+		{
+			const FTransform CanopyTransform = ScorpionMesh->GetSocketTransform(
+				SelfDestructCanopyBone, RTS_World);
+			CanopyLocation = CanopyTransform.GetLocation();
+			CanopyRotation = CanopyTransform.Rotator();
+		}
+	}
 	TArray<AActor*> IgnoreActors;
 	APawn* InstigatorPawn = DamageInstigator != nullptr ? DamageInstigator->GetPawn() : nullptr;
 	if (InstigatorPawn != nullptr)
@@ -1028,6 +1368,8 @@ void AUTVehicle_Scorpion::SelfDestruct(AActor* ImpactedActor)
 	UUTGameplayStatics::UTHurtRadius(this, SelfDestructDamage, 0.0f, SelfDestructMomentum,
 		Origin, 0.0f, SelfDestructRadius, 1.0f,
 		UUTDmgType_ScorpionSelfDestruct::StaticClass(), IgnoreActors, this, DamageInstigator);
+	MulticastPlaySelfDestructEffects(Origin, EffectRotation, CanopyLocation,
+		CanopyRotation, InheritedVelocity);
 
 	bBoostersActivated = false;
 	bSelfDestructArmed = false;

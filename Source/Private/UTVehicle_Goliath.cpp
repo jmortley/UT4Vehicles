@@ -8,12 +8,98 @@
 #include "Camera/CameraComponent.h"
 #include "GameFramework/Controller.h"
 #include "GameFramework/SpringArmComponent.h"
+#include "Kismet/GameplayStatics.h"
+#include "Particles/ParticleSystem.h"
 #include "PhysicsEngine/BodySetup.h"
+#include "PhysicsEngine/PhysicsAsset.h"
+#include "Sound/SoundBase.h"
+#include "UnrealNetwork.h"
 
 namespace
 {
+	FRotator AddUT3Spread(const FRotator& BaseAim, float Spread)
+	{
+		if (Spread <= 0.0f)
+		{
+			return BaseAim;
+		}
+
+		const FRotationMatrix AimMatrix(BaseAim);
+		const FVector X = AimMatrix.GetScaledAxis(EAxis::X);
+		const FVector Y = AimMatrix.GetScaledAxis(EAxis::Y);
+		const FVector Z = AimMatrix.GetScaledAxis(EAxis::Z);
+		const float RandY = FMath::FRand() - 0.5f;
+		const float RandZ = FMath::Sqrt(FMath::Max(0.0f, 0.5f - FMath::Square(RandY))) *
+			(FMath::FRand() - 0.5f);
+		return (X + RandY * Spread * Y + RandZ * Spread * Z).Rotation();
+	}
+
+	FVector GetWheelRestingPositionInChassisSpace(const FWheelSetup& WheelSetup,
+		const USkeletalMeshComponent* Mesh)
+	{
+		const UVehicleWheel* WheelDefaults = WheelSetup.WheelClass != nullptr
+			? WheelSetup.WheelClass->GetDefaultObject<UVehicleWheel>() : nullptr;
+		FVector RestingPosition =
+			(WheelDefaults != nullptr ? WheelDefaults->Offset : FVector::ZeroVector) +
+			WheelSetup.AdditionalOffset;
+
+		if (Mesh == nullptr || Mesh->SkeletalMesh == nullptr || WheelSetup.BoneName == NAME_None)
+		{
+			return RestingPosition;
+		}
+
+		const FVector MeshScale = Mesh->GetRelativeTransform().GetScale3D();
+		FVector BonePosition = Mesh->SkeletalMesh->GetComposedRefPoseMatrix(
+			WheelSetup.BoneName).GetOrigin() * MeshScale;
+
+		// Match UWheeledVehicleMovementComponent::GetWheelRestingPosition().
+		// PhysX stores wheel centres relative to the root physics BODY, which is
+		// not necessarily the skeletal mesh's root. The Goliath's Chassis body is
+		// translated by roughly 97 uu, so treating mesh-space as chassis-space
+		// leaves every tire above its maximum suspension reach.
+		const FBodyInstance* ChassisBody = Mesh->GetBodyInstance();
+		if (ChassisBody != nullptr && ChassisBody->BodySetup != nullptr)
+		{
+			const FMatrix RootBodyMatrix = Mesh->SkeletalMesh->GetComposedRefPoseMatrix(
+				ChassisBody->BodySetup->BoneName);
+			BonePosition = RootBodyMatrix.InverseTransformPosition(BonePosition);
+		}
+
+		return RestingPosition + BonePosition;
+	}
+
+	FVector GetWheelRestingPositionInMeshSpace(const FWheelSetup& WheelSetup,
+		const USkeletalMeshComponent* Mesh)
+	{
+		const FVector ChassisSpacePosition =
+			GetWheelRestingPositionInChassisSpace(WheelSetup, Mesh);
+		if (Mesh == nullptr || Mesh->SkeletalMesh == nullptr)
+		{
+			return ChassisSpacePosition;
+		}
+
+		const FBodyInstance* ChassisBody = Mesh->GetBodyInstance();
+		if (ChassisBody == nullptr || ChassisBody->BodySetup == nullptr)
+		{
+			return ChassisSpacePosition;
+		}
+
+		// SetActorLocation() moves the skeletal mesh component, while PhysX wheel
+		// centres are relative to the Chassis body. Convert back through the same
+		// root-body reference transform that the engine removes during setup.
+		const FMatrix RootBodyMatrix = Mesh->SkeletalMesh->GetComposedRefPoseMatrix(
+			ChassisBody->BodySetup->BoneName);
+		return RootBodyMatrix.TransformPosition(ChassisSpacePosition);
+	}
+
 	void ConfigureGoliathDrive(UUTVehicleMovementTank* Movement, USkeletalMeshComponent* Mesh)
 	{
+		if (UUTVehicleMeshComponent* VehicleMesh = Cast<UUTVehicleMeshComponent>(Mesh))
+		{
+			VehicleMesh->WeaponYawBoneName = FName(TEXT("Object01"));
+			VehicleMesh->WeaponPitchBoneName = FName(TEXT("Object09"));
+		}
+
 		if (Movement == nullptr)
 		{
 			return;
@@ -61,12 +147,11 @@ namespace
 				}
 			}
 
-			const FVector MeshScale = Mesh->GetRelativeTransform().GetScale3D();
 			for (FWheelSetup& WheelSetup : Movement->WheelSetups)
 			{
-				const FVector BonePosition = Mesh->SkeletalMesh->GetComposedRefPoseMatrix(
-					WheelSetup.BoneName).GetOrigin() * MeshScale;
-				WheelSetup.AdditionalOffset.Z = TargetRestHeight - BonePosition.Z;
+				const float CurrentRestHeight =
+					GetWheelRestingPositionInChassisSpace(WheelSetup, Mesh).Z;
+				WheelSetup.AdditionalOffset.Z += TargetRestHeight - CurrentRestHeight;
 			}
 		}
 
@@ -123,6 +208,22 @@ AUTVehicle_Goliath::AUTVehicle_Goliath(const FObjectInitializer& ObjectInitializ
 	{
 		GetMesh()->SetSkeletalMesh(MeshFinder.Object);
 	}
+	// The stock imported physics asset contains turret, tread, and wheel bodies.
+	// Disabling those bodies after initialization is too late for the Goliath:
+	// they can already destabilize its bounds/PhysX state, launching an untouched
+	// spawn outside the world before its parking lock can hold it. The imported
+	// vehicle content includes this one-body Chassis asset specifically for
+	// the native vehicle path, so select it before physics is initialized.
+	static ConstructorHelpers::FObjectFinder<UPhysicsAsset> ChassisPhysicsFinder(
+		TEXT("/Game/RestrictedAssets/Proto/UT3_Vehicles/VH_Goliath/Meshes/PA_Goliath_ChassisOnly"));
+	if (ChassisPhysicsFinder.Succeeded())
+	{
+		// UE4.15's SetPhysicsAsset() tries to rebuild articulated physics when a
+		// SkeletalMesh is already assigned and dereferences GetWorld(). CDO
+		// construction has no world, so set the public override directly; normal
+		// component initialization will consume it when physics is actually created.
+		GetMesh()->PhysicsAssetOverride = ChassisPhysicsFinder.Object;
+	}
 	static ConstructorHelpers::FObjectFinder<UMaterialInterface> BodyMaterialFinder(
 		TEXT("/Game/RestrictedAssets/Proto/UT3_Vehicles/VH_Goliath/Materials/M_Goliath"));
 	static ConstructorHelpers::FObjectFinder<UMaterialInterface> TreadMaterialFinder(
@@ -169,9 +270,21 @@ AUTVehicle_Goliath::AUTVehicle_Goliath(const FObjectInitializer& ObjectInitializ
 	TankShellClass = AUTProj_TankShell::StaticClass();
 	CannonMuzzleSocket = FName(TEXT("TurretFireSocket"));
 	CannonFireInterval = 2.5f;
+	CannonAimRotationRate = 60.0f;
+	CannonSpread = 0.015f;
+	static ConstructorHelpers::FObjectFinder<UParticleSystem> CannonMuzzleEffectFinder(
+		TEXT("/Game/RestrictedAssets/Weapons/Weapon_Effects/Particles/P_RocketLauncher_MF_01_3P"));
+	CannonMuzzleEffect = CannonMuzzleEffectFinder.Object;
+	static ConstructorHelpers::FObjectFinder<USoundBase> CannonFireSoundFinder(
+		TEXT("/Game/Mogno/Vehicles/Goliath/SFX/A_Vehicle_Goliath_Fire01"));
+	CannonFireSound = CannonFireSoundFinder.Object;
 	bCannonFiring = false;
 	bSpawnParkingLocked = false;
 	NextCannonFireTime = -1000.0f;
+	LastCannonAimSendTime = -1000.0f;
+	ReplicatedCannonAim = FRotator::ZeroRotator;
+	CurrentCannonAim = FRotator::ZeroRotator;
+	LastSentCannonAim = FRotator::ZeroRotator;
 
 	GetMesh()->BodyInstance.COMNudge = FVector(-20.0f, 0.0f, -30.0f);
 	ConfigureGoliathDrive(CastChecked<UUTVehicleMovementTank>(GetVehicleMovementComponent()), GetMesh());
@@ -212,7 +325,7 @@ void AUTVehicle_Goliath::PostInitializeComponents()
 		? ChassisBody->BodySetup->AggGeom.CalcAABB(FTransform(FQuat::Identity,
 			FVector::ZeroVector, GetMesh()->GetRelativeTransform().GetScale3D()))
 		: FBox(ForceInit);
-	UE_LOG(LogTemp, Warning, TEXT("[GoliathPhysics] Setup Physics=%d ChassisBone=%s ChassisZ=(%.2f..%.2f) ParkHeight=%.2f WheelOffsetZ=(%.2f,%.2f,%.2f,%.2f)"),
+	UE_LOG(LogTemp, Warning, TEXT("[GoliathPhysics] Setup Physics=%d ChassisBone=%s ChassisZ=(%.2f..%.2f) ParkHeight=%.2f WheelOffsetZ=(%.2f,%.2f,%.2f,%.2f) WheelRestBodyZ=(%.2f,%.2f,%.2f,%.2f) WheelRestMeshZ=(%.2f,%.2f,%.2f,%.2f)"),
 		Movement != nullptr && Movement->HasValidPhysicsState() ? 1 : 0,
 		ChassisBody != nullptr && ChassisBody->BodySetup != nullptr
 			? *ChassisBody->BodySetup->BoneName.ToString() : TEXT("NONE"),
@@ -222,7 +335,15 @@ void AUTVehicle_Goliath::PostInitializeComponents()
 		Movement != nullptr && Movement->WheelSetups.IsValidIndex(0) ? Movement->WheelSetups[0].AdditionalOffset.Z : 0.0f,
 		Movement != nullptr && Movement->WheelSetups.IsValidIndex(1) ? Movement->WheelSetups[1].AdditionalOffset.Z : 0.0f,
 		Movement != nullptr && Movement->WheelSetups.IsValidIndex(2) ? Movement->WheelSetups[2].AdditionalOffset.Z : 0.0f,
-		Movement != nullptr && Movement->WheelSetups.IsValidIndex(3) ? Movement->WheelSetups[3].AdditionalOffset.Z : 0.0f);
+		Movement != nullptr && Movement->WheelSetups.IsValidIndex(3) ? Movement->WheelSetups[3].AdditionalOffset.Z : 0.0f,
+		Movement != nullptr && Movement->WheelSetups.IsValidIndex(0) ? GetWheelRestingPositionInChassisSpace(Movement->WheelSetups[0], GetMesh()).Z : 0.0f,
+		Movement != nullptr && Movement->WheelSetups.IsValidIndex(1) ? GetWheelRestingPositionInChassisSpace(Movement->WheelSetups[1], GetMesh()).Z : 0.0f,
+		Movement != nullptr && Movement->WheelSetups.IsValidIndex(2) ? GetWheelRestingPositionInChassisSpace(Movement->WheelSetups[2], GetMesh()).Z : 0.0f,
+		Movement != nullptr && Movement->WheelSetups.IsValidIndex(3) ? GetWheelRestingPositionInChassisSpace(Movement->WheelSetups[3], GetMesh()).Z : 0.0f,
+		Movement != nullptr && Movement->WheelSetups.IsValidIndex(0) ? GetWheelRestingPositionInMeshSpace(Movement->WheelSetups[0], GetMesh()).Z : 0.0f,
+		Movement != nullptr && Movement->WheelSetups.IsValidIndex(1) ? GetWheelRestingPositionInMeshSpace(Movement->WheelSetups[1], GetMesh()).Z : 0.0f,
+		Movement != nullptr && Movement->WheelSetups.IsValidIndex(2) ? GetWheelRestingPositionInMeshSpace(Movement->WheelSetups[2], GetMesh()).Z : 0.0f,
+		Movement != nullptr && Movement->WheelSetups.IsValidIndex(3) ? GetWheelRestingPositionInMeshSpace(Movement->WheelSetups[3], GetMesh()).Z : 0.0f);
 }
 
 void AUTVehicle_Goliath::BeginPlay()
@@ -271,8 +392,91 @@ void AUTVehicle_Goliath::BeginPlay()
 void AUTVehicle_Goliath::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
+	UpdateCannonAim(DeltaSeconds);
 	ApplyTankSteering();
 	UpdateVacantParking(DeltaSeconds);
+}
+
+void AUTVehicle_Goliath::GetLifetimeReplicatedProps(
+	TArray<FLifetimeProperty>& OutLifetimeProps) const
+{
+	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+	DOREPLIFETIME_CONDITION(AUTVehicle_Goliath, ReplicatedCannonAim, COND_SkipOwner);
+}
+
+FRotator AUTVehicle_Goliath::SanitizeCannonAim(const FRotator& AimRotation) const
+{
+	FRotator Result;
+	Result.Pitch = FMath::Clamp(FRotator::NormalizeAxis(AimRotation.Pitch), -10.0f, 35.0f);
+	Result.Yaw = FRotator::NormalizeAxis(AimRotation.Yaw);
+	Result.Roll = 0.0f;
+	return Result;
+}
+
+FRotator AUTVehicle_Goliath::GetDesiredCannonAimRotation() const
+{
+	const FRotator WorldAim = Controller != nullptr
+		? Controller->GetControlRotation()
+		: GetActorRotation();
+	const USkeletalMeshComponent* Mesh = GetMesh();
+	if (Mesh == nullptr)
+	{
+		return SanitizeCannonAim(WorldAim - GetActorRotation());
+	}
+	const FVector LocalAimDirection = Mesh->GetComponentTransform().InverseTransformVectorNoScale(
+		WorldAim.Vector());
+	return SanitizeCannonAim(LocalAimDirection.Rotation());
+}
+
+void AUTVehicle_Goliath::UpdateCannonAim(float DeltaSeconds)
+{
+	const bool bOccupied = VehicleComponent != nullptr && VehicleComponent->HasDriver() &&
+		!VehicleComponent->bDead;
+	if (bOccupied && IsLocallyControlled())
+	{
+		const FRotator DesiredAim = GetDesiredCannonAimRotation();
+		ReplicatedCannonAim = DesiredAim;
+		if (Role < ROLE_Authority && GetWorld() != nullptr)
+		{
+			const float Now = GetWorld()->GetTimeSeconds();
+			const bool bAimChanged =
+				FMath::Abs(FMath::FindDeltaAngleDegrees(LastSentCannonAim.Yaw, DesiredAim.Yaw)) >= 0.25f ||
+				FMath::Abs(FMath::FindDeltaAngleDegrees(LastSentCannonAim.Pitch, DesiredAim.Pitch)) >= 0.25f;
+			if (bAimChanged && Now - LastCannonAimSendTime >= 0.05f)
+			{
+				LastSentCannonAim = DesiredAim;
+				LastCannonAimSendTime = Now;
+				ServerSetCannonAim(DesiredAim);
+			}
+		}
+	}
+
+	CurrentCannonAim = FMath::RInterpConstantTo(CurrentCannonAim,
+		SanitizeCannonAim(ReplicatedCannonAim), DeltaSeconds, CannonAimRotationRate);
+	if (UUTVehicleMeshComponent* VehicleMesh = Cast<UUTVehicleMeshComponent>(GetMesh()))
+	{
+		VehicleMesh->SetWeaponAimRotation(CurrentCannonAim);
+	}
+}
+
+bool AUTVehicle_Goliath::ServerSetCannonAim_Validate(FRotator NewAimRotation)
+{
+	return FMath::IsFinite(NewAimRotation.Pitch) && FMath::IsFinite(NewAimRotation.Yaw) &&
+		FMath::IsFinite(NewAimRotation.Roll);
+}
+
+void AUTVehicle_Goliath::ServerSetCannonAim_Implementation(FRotator NewAimRotation)
+{
+	if (VehicleComponent != nullptr && VehicleComponent->HasDriver() && !VehicleComponent->bDead)
+	{
+		ReplicatedCannonAim = SanitizeCannonAim(NewAimRotation);
+		ForceNetUpdate();
+	}
+}
+
+void AUTVehicle_Goliath::OnRep_CannonAim()
+{
+	ReplicatedCannonAim = SanitizeCannonAim(ReplicatedCannonAim);
 }
 
 float AUTVehicle_Goliath::GetParkedHeightAboveGround() const
@@ -286,10 +490,8 @@ float AUTVehicle_Goliath::GetParkedHeightAboveGround() const
 	}
 
 	const FWheelSetup& WheelSetup = Movement->WheelSetups[0];
-	const FVector MeshScale = Mesh->GetRelativeTransform().GetScale3D();
 	const float LocalWheelCenterZ =
-		(Mesh->SkeletalMesh->GetComposedRefPoseMatrix(WheelSetup.BoneName).GetOrigin() * MeshScale).Z +
-		WheelSetup.AdditionalOffset.Z;
+		GetWheelRestingPositionInMeshSpace(WheelSetup, Mesh).Z;
 	const UVehicleWheel* WheelDefaults = WheelSetup.WheelClass->GetDefaultObject<UVehicleWheel>();
 	const float WheelRadius = WheelDefaults != nullptr ? WheelDefaults->ShapeRadius : 30.0f;
 	// Two units keep the tire touching the floor without beginning in penetration.
@@ -458,11 +660,12 @@ void AUTVehicle_Goliath::OnPrimaryFirePressed()
 {
 	if (Role == ROLE_Authority)
 	{
+		ReplicatedCannonAim = GetDesiredCannonAimRotation();
 		SetCannonFiring(true);
 	}
 	else
 	{
-		ServerSetCannonFiring(true);
+		ServerSetCannonFiring(true, GetDesiredCannonAimRotation());
 	}
 }
 
@@ -470,21 +673,25 @@ void AUTVehicle_Goliath::OnPrimaryFireReleased()
 {
 	if (Role == ROLE_Authority)
 	{
+		ReplicatedCannonAim = GetDesiredCannonAimRotation();
 		SetCannonFiring(false);
 	}
 	else
 	{
-		ServerSetCannonFiring(false);
+		ServerSetCannonFiring(false, GetDesiredCannonAimRotation());
 	}
 }
 
-bool AUTVehicle_Goliath::ServerSetCannonFiring_Validate(bool)
+bool AUTVehicle_Goliath::ServerSetCannonFiring_Validate(bool, FRotator NewAimRotation)
 {
-	return true;
+	return FMath::IsFinite(NewAimRotation.Pitch) && FMath::IsFinite(NewAimRotation.Yaw) &&
+		FMath::IsFinite(NewAimRotation.Roll);
 }
 
-void AUTVehicle_Goliath::ServerSetCannonFiring_Implementation(bool bNewFiring)
+void AUTVehicle_Goliath::ServerSetCannonFiring_Implementation(bool bNewFiring,
+	FRotator NewAimRotation)
 {
+	ReplicatedCannonAim = SanitizeCannonAim(NewAimRotation);
 	SetCannonFiring(bNewFiring);
 }
 
@@ -530,7 +737,7 @@ void AUTVehicle_Goliath::FireCannon()
 	{
 		SpawnLocation = Mesh->GetSocketLocation(CannonMuzzleSocket);
 	}
-	const FRotator SpawnRotation = GetCannonAimRotation();
+	const FRotator SpawnRotation = AddUT3Spread(GetCannonAimRotation(), CannonSpread);
 
 	FActorSpawnParameters SpawnParameters;
 	SpawnParameters.Owner = this;
@@ -554,6 +761,7 @@ void AUTVehicle_Goliath::FireCannon()
 			GetMesh()->AddImpulseAtLocation(-0.5f * Shell->GetVelocity(),
 				GetActorLocation() + FVector(0.0f, 0.0f, 90.0f));
 		}
+		MulticastPlayCannonFire(SpawnLocation, SpawnRotation);
 	}
 
 	NextCannonFireTime = Now + CannonFireInterval;
@@ -563,10 +771,31 @@ void AUTVehicle_Goliath::FireCannon()
 
 FRotator AUTVehicle_Goliath::GetCannonAimRotation() const
 {
-	FRotator AimRotation = Controller != nullptr ? Controller->GetControlRotation() : GetActorRotation();
-	AimRotation.Pitch = FMath::Clamp(FRotator::NormalizeAxis(AimRotation.Pitch), -10.0f, 35.0f);
-	AimRotation.Roll = 0.0f;
-	return AimRotation;
+	const USkeletalMeshComponent* Mesh = GetMesh();
+	const FRotator ProjectileAim = SanitizeCannonAim(ReplicatedCannonAim);
+	const FVector WorldAimDirection = Mesh != nullptr
+		? Mesh->GetComponentTransform().TransformVectorNoScale(ProjectileAim.Vector())
+		: GetActorTransform().TransformVectorNoScale(ProjectileAim.Vector());
+	return WorldAimDirection.Rotation();
+}
+
+void AUTVehicle_Goliath::MulticastPlayCannonFire_Implementation(
+	FVector MuzzleLocation, FRotator MuzzleRotation)
+{
+	if (GetWorld() == nullptr || GetWorld()->GetNetMode() == NM_DedicatedServer)
+	{
+		return;
+	}
+	if (CannonMuzzleEffect != nullptr)
+	{
+		UGameplayStatics::SpawnEmitterAtLocation(GetWorld(), CannonMuzzleEffect,
+			MuzzleLocation, MuzzleRotation, true);
+	}
+	if (CannonFireSound != nullptr)
+	{
+		UGameplayStatics::PlaySoundAtLocation(this, CannonFireSound, MuzzleLocation,
+			1.0f, 1.0f, 0.0f, VehicleSoundAttenuation);
+	}
 }
 
 bool AUTVehicle_Goliath::HandleDriverLeaveRequest()
