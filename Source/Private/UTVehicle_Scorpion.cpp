@@ -6,6 +6,8 @@
 #include "UTVehicleMeshComponent.h"
 #include "UTProj_ScorpionGlob.h"
 #include "UTGameplayStatics.h"
+#include "UTImpactEffect.h"
+#include "UTProjectile.h"
 #include "UnrealNetwork.h"
 #include "PhysicsEngine/BodySetup.h"
 #include "TireConfig.h"
@@ -14,6 +16,7 @@
 #include "Sound/SoundWave.h"
 #include "Camera/CameraActor.h"
 #include "Camera/CameraComponent.h"
+#include "Components/SphereComponent.h"
 #include "Components/StaticMeshComponent.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/StaticMeshActor.h"
@@ -180,12 +183,16 @@ AUTVehicle_Scorpion::AUTVehicle_Scorpion(const FObjectInitializer& ObjectInitial
 	BoostRechargeDuration = 5.0f;
 	BoostTargetSpeed = 4400.0f;
 	BoostAcceleration = 8500.0f;
-	GunProjectileClass = AUTProj_ScorpionGlob::StaticClass();
+	static ConstructorHelpers::FClassFinder<AUTProjectile> GrenadeProjectileFinder(
+		TEXT("/Game/RestrictedAssets/Weapons/GrenadeLauncher/BP_Grenade"));
+	GunProjectileClass = GrenadeProjectileFinder.Succeeded()
+		? GrenadeProjectileFinder.Class
+		: AUTProj_ScorpionGlob::StaticClass();
 	GunMuzzleSocket = FName(TEXT("TurretFireSocket"));
 	GunFireInterval = 0.65f;
 	GunAimRotationRate = 360.0f;
 	static ConstructorHelpers::FObjectFinder<UParticleSystem> GunMuzzleEffectFinder(
-		TEXT("/Game/RestrictedAssets/Weapons/LinkGun/Effects/P_FX_LinkGun_MF_Primary"));
+		TEXT("/Game/RestrictedAssets/Weapons/GrenadeLauncher/Effects/P_GrenadeLauncher_MF"));
 	GunMuzzleEffect = GunMuzzleEffectFinder.Object;
 	static ConstructorHelpers::FObjectFinder<USoundBase> GunFireSoundFinder(
 		TEXT("/Game/Mogno/Vehicles/ScorpionTest/SFX/A_Vehicle_Scorpion_AltFire01"));
@@ -204,10 +211,12 @@ AUTVehicle_Scorpion::AUTVehicle_Scorpion(const FObjectInitializer& ObjectInitial
 	NormalDriveAcceleration = 4500.0f;
 	SelfDestructMinBoostTime = 0.15f;
 	SelfDestructMinSpeed = 1800.0f;
-	SelfDestructFuseDuration = 1.0f;
+	SelfDestructFuseDuration = 2.5f;
 	SelfDestructDamage = 600.0f;
 	SelfDestructRadius = 600.0f;
 	SelfDestructMomentum = 200000.0f;
+	SelfDestructEffectScale = 2.5f;
+	SelfDestructBlastScale = 2.25f;
 	SelfDestructCanopyBone = FName(TEXT("Hatch_Slide"));
 	SelfDestructCanopyLaunchVelocity = FVector(250.0f, 0.0f, 900.0f);
 	SelfDestructCanopyAngularVelocity = FVector(180.0f, 420.0f, 260.0f);
@@ -243,6 +252,9 @@ AUTVehicle_Scorpion::AUTVehicle_Scorpion(const FObjectInitializer& ObjectInitial
 	static ConstructorHelpers::FObjectFinder<UParticleSystem> SelfDestructEffectFinder(
 		TEXT("/Game/RestrictedAssets/Proto/UT3_Vehicles/VH_Scorpion/Effects/P_VH_Scorpion_SelfDestruct"));
 	SelfDestructEffect = SelfDestructEffectFinder.Object;
+	static ConstructorHelpers::FClassFinder<AUTImpactEffect> SelfDestructBlastFinder(
+		TEXT("/Game/RestrictedAssets/Weapons/GrenadeLauncher/GrenadeExplodeBig"));
+	SelfDestructBlastEffect = SelfDestructBlastFinder.Class;
 	static ConstructorHelpers::FObjectFinder<UStaticMesh> SelfDestructCanopyFinder(
 		TEXT("/Game/RestrictedAssets/Proto/UT3_Vehicles/VH_Scorpion/Meshes/S_FX_ScorpionCanopy"));
 	SelfDestructCanopyMesh = SelfDestructCanopyFinder.Object;
@@ -747,21 +759,34 @@ void AUTVehicle_Scorpion::FireGun()
 	}
 	const FRotator SpawnRotation = GetAdjustedProjectileAimRotation();
 
+	// BP_Grenade reads its owner/instigator character to select team visuals.
+	// The hidden driver remains the authoritative character while possessing the
+	// Scorpion, so preserve that contract instead of giving the Blueprint a
+	// vehicle owner that its BeginPlay graph cannot cast.
+	APawn* ProjectileInstigator = VehicleComponent->Driver != nullptr
+		? VehicleComponent->Driver
+		: static_cast<APawn*>(this);
 	FActorSpawnParameters SpawnParameters;
-	SpawnParameters.Owner = this;
-	SpawnParameters.Instigator = this;
+	SpawnParameters.Owner = ProjectileInstigator;
+	SpawnParameters.Instigator = ProjectileInstigator;
 	SpawnParameters.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
 	UClass* ProjectileClass = GunProjectileClass.Get() != nullptr
 		? GunProjectileClass.Get()
 		: AUTProj_ScorpionGlob::StaticClass();
-	AUTProj_ScorpionGlob* Glob = GetWorld()->SpawnActor<AUTProj_ScorpionGlob>(
+	AUTProjectile* Grenade = GetWorld()->SpawnActor<AUTProjectile>(
 		ProjectileClass, SpawnLocation, SpawnRotation, SpawnParameters);
-	if (Glob != nullptr)
+	if (Grenade != nullptr)
 	{
-		Glob->InstigatorController = Controller != nullptr
+		Grenade->InstigatorController = Controller != nullptr
 			? Controller
 			: VehicleComponent->DamageInstigator;
-		Glob->InstigatorTeamNum = GetTeamNum();
+		Grenade->InstigatorTeamNum = GetTeamNum();
+		if (Grenade->CollisionComp != nullptr)
+		{
+			// The muzzle is outside the chassis, but explicitly ignoring the firing
+			// vehicle prevents a bounce from clipping the fast-moving Scorpion.
+			Grenade->CollisionComp->IgnoreActorWhenMoving(this, true);
+		}
 		MulticastPlayGunFire(SpawnLocation, SpawnRotation);
 	}
 
@@ -1177,9 +1202,11 @@ bool AUTVehicle_Scorpion::ArmSelfDestructAndEject()
 	VehicleComponent->SetEntryLocked(true);
 	GetWorldTimerManager().ClearTimer(BoostTimerHandle);
 
-	// Make the bail decisive enough to clear the car while inheriting its
-	// horizontal velocity. The now-empty Scorpion remains boosted during fuse.
-	if (!VehicleComponent->EjectDriver(FVector(0.0f, 0.0f, 1200.0f), true))
+	// Stock JumpBoots add 1500 uu/s. UT3-style boost-eject is deliberately much
+	// more violent: launch at exactly twice that impulse. Do not inherit the
+	// Scorpion's planar velocity; LaunchCharacter overwrites X/Y with zero so the
+	// driver leaves vertically at the instant boost-eject is pressed.
+	if (!VehicleComponent->EjectDriver(FVector(0.0f, 0.0f, 3000.0f), false))
 	{
 		bSelfDestructArmed = false;
 		VehicleComponent->SetEntryLocked(false);
@@ -1267,8 +1294,23 @@ void AUTVehicle_Scorpion::MulticastPlaySelfDestructEffects_Implementation(
 
 	if (SelfDestructEffect != nullptr)
 	{
+		const FTransform ImportedEffectTransform(EffectRotation, EffectLocation,
+			FVector(SelfDestructEffectScale));
 		UGameplayStatics::SpawnEmitterAtLocation(World, SelfDestructEffect,
-			EffectLocation, EffectRotation, true);
+			ImportedEffectTransform, true);
+	}
+
+	if (SelfDestructBlastEffect != nullptr)
+	{
+		// The imported UT3 system supplies the directional fire and smoke, but its
+		// old authored scale reads as a tiny flare in UT4. Layer the proven grenade
+		// launcher's full flash/fireball/smoke/audio effect beneath it. Scale is
+		// carried by the transform; UT4's radius-parameter constructor is not
+		// exported from the UnrealTournament module and cannot be linked here.
+		const FTransform BlastTransform(FRotator::ZeroRotator,
+			EffectLocation + FVector(0.0f, 0.0f, 30.0f), FVector(SelfDestructBlastScale));
+		SelfDestructBlastEffect.GetDefaultObject()->SpawnEffect(World, BlastTransform,
+			nullptr, this, nullptr, SRT_None);
 	}
 
 	if (SelfDestructCanopyMesh == nullptr)
@@ -1387,7 +1429,10 @@ void AUTVehicle_Scorpion::SelfDestruct(AActor* ImpactedActor)
 		GetMesh()->SetSimulatePhysics(false);
 		GetMesh()->SetVisibility(false, true);
 	}
-	SetLifeSpan(0.25f);
+	// Keep the torn-off source actor around long enough for the reliable cosmetic
+	// multicast to reach every relevant client; the mesh is already hidden and
+	// the independently spawned explosion components finish on their own.
+	SetLifeSpan(2.0f);
 	ForceNetUpdate();
 }
 

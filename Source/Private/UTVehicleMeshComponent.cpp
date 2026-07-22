@@ -6,6 +6,27 @@
 
 namespace
 {
+	void ResetBoneAndDescendantsToReferencePose(USkeletalMesh* SkeletalMesh,
+		TArray<FTransform>& ComponentPose, int32 RootBoneIndex)
+	{
+		if (SkeletalMesh == nullptr || !ComponentPose.IsValidIndex(RootBoneIndex))
+		{
+			return;
+		}
+
+		for (int32 BoneIndex = RootBoneIndex; BoneIndex < ComponentPose.Num(); ++BoneIndex)
+		{
+			if (BoneIndex == RootBoneIndex ||
+				SkeletalMesh->RefSkeleton.BoneIsChildOf(BoneIndex, RootBoneIndex))
+			{
+				ComponentPose[BoneIndex] = FTransform(
+					SkeletalMesh->GetComposedRefPoseMatrix(
+						SkeletalMesh->RefSkeleton.GetBoneName(BoneIndex)));
+				ComponentPose[BoneIndex].NormalizeRotation();
+			}
+		}
+	}
+
 	void RebaseBoneAndDescendants(USkeletalMesh* SkeletalMesh, TArray<FTransform>& ComponentPose,
 		int32 RootBoneIndex, const FQuat& RotationDelta, bool bLocalSpace)
 	{
@@ -40,6 +61,7 @@ namespace
 
 UUTVehicleMeshComponent::UUTVehicleMeshComponent(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
+	, bApplyWheelPose(true)
 	, VisualWheelCenterOffsetZ(0.0f)
 	, WeaponYawBoneName(NAME_None)
 	, WeaponPitchBoneName(NAME_None)
@@ -71,9 +93,9 @@ void UUTVehicleMeshComponent::RefreshBoneTransforms(FActorComponentTickFunction*
 		return;
 	}
 
-	const bool bHasWheelPose = Movement != nullptr && Movement->Wheels.Num() > 0 &&
+	const bool bHasWheelPose = bApplyWheelPose && Movement != nullptr && Movement->Wheels.Num() > 0 &&
 		Movement->IsActive();
-	if (Movement != nullptr && Movement->Wheels.Num() > 0 && !Movement->IsActive())
+	if (bApplyWheelPose && Movement != nullptr && Movement->Wheels.Num() > 0 && !Movement->IsActive())
 	{
 		// The Goliath's spawn parking lock teleports the chassis to its corrected
 		// ground height and then pauses vehicle simulation. Wheel->Location still
@@ -140,20 +162,33 @@ void UUTVehicleMeshComponent::RefreshBoneTransforms(FActorComponentTickFunction*
 		}
 	}
 
-	bool bAppliedWeaponPose = false;
 	const int32 YawBoneIndex = GetBoneIndex(WeaponYawBoneName);
+	const int32 PitchBoneIndex = GetBoneIndex(WeaponPitchBoneName);
+	bool bAppliedWeaponPose = false;
+	if (WheelPose.IsValidIndex(YawBoneIndex))
+	{
+		// RefreshBoneTransforms() can preserve this component's previous edited
+		// component-space buffer when no AnimInstance drives the imported mesh.
+		// Reset the whole rigid turret tree before applying today's absolute aim;
+		// otherwise the full yaw/pitch is added again every frame and it spins.
+		ResetBoneAndDescendantsToReferencePose(SkeletalMesh, WheelPose, YawBoneIndex);
+		bAppliedWeaponPose = true;
+	}
+	else if (WheelPose.IsValidIndex(PitchBoneIndex))
+	{
+		ResetBoneAndDescendantsToReferencePose(SkeletalMesh, WheelPose, PitchBoneIndex);
+		bAppliedWeaponPose = true;
+	}
+
 	if (WheelPose.IsValidIndex(YawBoneIndex) && !FMath::IsNearlyZero(WeaponAimRotation.Yaw))
 	{
 		RebaseBoneAndDescendants(SkeletalMesh, WheelPose, YawBoneIndex,
 			FQuat(FRotator(0.0f, WeaponAimRotation.Yaw, 0.0f)), false);
-		bAppliedWeaponPose = true;
 	}
-	const int32 PitchBoneIndex = GetBoneIndex(WeaponPitchBoneName);
 	if (WheelPose.IsValidIndex(PitchBoneIndex) && !FMath::IsNearlyZero(WeaponAimRotation.Pitch))
 	{
 		RebaseBoneAndDescendants(SkeletalMesh, WheelPose, PitchBoneIndex,
 			FQuat(FRotator(WeaponAimRotation.Pitch, 0.0f, 0.0f)), true);
-		bAppliedWeaponPose = true;
 	}
 
 	if (AppliedWheels > 0 || bAppliedWeaponPose)

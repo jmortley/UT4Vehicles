@@ -11,12 +11,104 @@
 #include "Kismet/GameplayStatics.h"
 #include "Particles/ParticleSystem.h"
 #include "PhysicsEngine/BodySetup.h"
+#include "PhysicsEngine/BoxElem.h"
 #include "PhysicsEngine/PhysicsAsset.h"
 #include "Sound/SoundBase.h"
 #include "UnrealNetwork.h"
 
 namespace
 {
+	void TeleportGoliathPhysics(USkeletalMeshComponent* Mesh, AActor* Vehicle,
+		const FVector& TargetLocation, const FRotator& TargetRotation)
+	{
+		if (Mesh == nullptr || Vehicle == nullptr ||
+			Mesh->GetBodyInstance() == nullptr ||
+			!Mesh->GetBodyInstance()->IsValidBodyInstance())
+		{
+			if (Vehicle != nullptr)
+			{
+				Vehicle->SetActorLocationAndRotation(TargetLocation, TargetRotation,
+					false, nullptr, ETeleportType::TeleportPhysics);
+			}
+			return;
+		}
+
+		// UPrimitiveComponent::SendPhysicsTransform() writes its embedded
+		// BodyInstance. A skeletal vehicle's actual chassis lives in Bodies[], so
+		// SetActorLocation() can move the rendered component while leaving the
+		// PhysX vehicle and suspension rays at the old spawn transform. Move the
+		// skeletal bodies explicitly, then let SyncComponentToRBPhysics() (called
+		// by ApplyDeltaToAllPhysicsTransforms) bring the actor along with them.
+		const FQuat CurrentRotation = Vehicle->GetActorQuat();
+		const FQuat DesiredRotation = TargetRotation.Quaternion();
+		const FQuat RotationDelta = CurrentRotation.Inverse() * DesiredRotation;
+		if (!RotationDelta.Equals(FQuat::Identity, KINDA_SMALL_NUMBER))
+		{
+			Mesh->ApplyDeltaToAllPhysicsTransforms(FVector::ZeroVector, RotationDelta);
+		}
+
+		// Rotation about the root body can alter the component-space pivot offset,
+		// so calculate translation only after the rotation has synchronized.
+		const FVector TranslationDelta = TargetLocation - Vehicle->GetActorLocation();
+		if (!TranslationDelta.IsNearlyZero())
+		{
+			Mesh->ApplyDeltaToAllPhysicsTransforms(TranslationDelta, FQuat::Identity);
+		}
+	}
+
+	void ConfigureGoliathChassisCollision(UPhysicsAsset* PhysicsAsset,
+		const USkeletalMesh* SkeletalMesh)
+	{
+		if (PhysicsAsset == nullptr || SkeletalMesh == nullptr)
+		{
+			return;
+		}
+
+		const FName ChassisBone(TEXT("Chassis"));
+		const int32 ChassisBodyIndex = PhysicsAsset->FindBodyIndex(ChassisBone);
+		if (!PhysicsAsset->SkeletalBodySetups.IsValidIndex(ChassisBodyIndex))
+		{
+			return;
+		}
+
+		USkeletalBodySetup* ChassisSetup =
+			PhysicsAsset->SkeletalBodySetups[ChassisBodyIndex];
+		if (ChassisSetup == nullptr)
+		{
+			return;
+		}
+
+		// The auto-generated body shipped in PA_Goliath_ChassisOnly is one
+		// capsule with radius ~205 uu. It encloses the tank lengthwise, but also
+		// extends about 105 uu below the rendered treads. The tank consequently
+		// parks in mid-air and behaves like it is balanced on a ball as soon as
+		// suspension wakes. Simple boxes are created directly by PhysX (no cooked
+		// convex data), so replacing that dedicated asset's aggregate here is safe
+		// in editor, client, and server builds.
+		ChassisSetup->AggGeom.EmptyElements();
+		const FTransform ChassisToMesh(
+			SkeletalMesh->GetComposedRefPoseMatrix(ChassisBone));
+
+		auto AddMeshSpaceBox = [ChassisSetup, &ChassisToMesh](
+			const FVector& Center, const FVector& Size)
+		{
+			FKBoxElem Box(Size.X, Size.Y, Size.Z);
+			const FTransform BoxInMesh(FQuat::Identity, Center);
+			Box.SetTransform(BoxInMesh.GetRelativeTransform(ChassisToMesh));
+			ChassisSetup->AggGeom.BoxElems.Add(Box);
+		};
+
+		// Lower tread/chassis shell plus the narrower upper hull. Both remain on
+		// the Chassis body, so the turret can rotate visually without dragging a
+		// stale collision primitive through nearby players.
+		AddMeshSpaceBox(FVector(-5.0f, 0.0f, 42.0f),
+			FVector(390.0f, 230.0f, 80.0f));
+		AddMeshSpaceBox(FVector(-25.0f, 0.0f, 88.0f),
+			FVector(300.0f, 180.0f, 30.0f));
+		ChassisSetup->CollisionTraceFlag = CTF_UseSimpleAsComplex;
+		ChassisSetup->bNeverNeedsCookedCollisionData = true;
+	}
+
 	FRotator AddUT3Spread(const FRotator& BaseAim, float Spread)
 	{
 		if (Spread <= 0.0f)
@@ -68,34 +160,39 @@ namespace
 		return RestingPosition + BonePosition;
 	}
 
-	FVector GetWheelRestingPositionInMeshSpace(const FWheelSetup& WheelSetup,
-		const USkeletalMeshComponent* Mesh)
+	bool GetWheelRestingPositionInWorldSpace(const FWheelSetup& WheelSetup,
+		const USkeletalMeshComponent* Mesh, FVector& OutPosition)
 	{
 		const FVector ChassisSpacePosition =
 			GetWheelRestingPositionInChassisSpace(WheelSetup, Mesh);
-		if (Mesh == nullptr || Mesh->SkeletalMesh == nullptr)
+		if (Mesh == nullptr)
 		{
-			return ChassisSpacePosition;
+			return false;
 		}
 
 		const FBodyInstance* ChassisBody = Mesh->GetBodyInstance();
-		if (ChassisBody == nullptr || ChassisBody->BodySetup == nullptr)
+		if (ChassisBody == nullptr || !ChassisBody->IsValidBodyInstance())
 		{
-			return ChassisSpacePosition;
+			return false;
 		}
 
-		// SetActorLocation() moves the skeletal mesh component, while PhysX wheel
-		// centres are relative to the Chassis body. Convert back through the same
-		// root-body reference transform that the engine removes during setup.
-		const FMatrix RootBodyMatrix = Mesh->SkeletalMesh->GetComposedRefPoseMatrix(
-			ChassisBody->BodySetup->BoneName);
-		return RootBodyMatrix.TransformPosition(ChassisSpacePosition);
+		// SetupVehicleShapes() gives this exact body-local point to PhysX. Convert
+		// it through the live rigid actor, not the skeleton's reference-pose bone:
+		// the imported Goliath chassis geometry has a substantial body-origin
+		// offset that the ref-pose matrix does not contain.
+		OutPosition = ChassisBody->GetUnrealWorldTransform(false)
+			.TransformPosition(ChassisSpacePosition);
+		return true;
 	}
 
 	void ConfigureGoliathDrive(UUTVehicleMovementTank* Movement, USkeletalMeshComponent* Mesh)
 	{
 		if (UUTVehicleMeshComponent* VehicleMesh = Cast<UUTVehicleMeshComponent>(Mesh))
 		{
+			// Goliath road wheels are decorative pieces inside continuous treads.
+			// Copying four fake PhysX contact locations onto those bones tears them
+			// away from the hull; keep the authored assembly intact.
+			VehicleMesh->bApplyWheelPose = false;
 			VehicleMesh->WeaponYawBoneName = FName(TEXT("Object01"));
 			VehicleMesh->WeaponPitchBoneName = FName(TEXT("Object09"));
 		}
@@ -129,29 +226,32 @@ namespace
 		Movement->WheelSetups[3].AdditionalOffset.Y = 20.0f;
 
 		// Imported UT3 wheel bones are animation pivots, not guaranteed PhysX rest
-		// positions. Put every contact at one chassis-derived height, leaving ten
-		// units of clearance below the chassis collision. This prevents a deeply
-		// compressed suspension from applying a launch impulse on its first tick.
+		// positions. Put every contact one wheel radius above the bottom of the
+		// aligned chassis collision. Parking adds its own two-unit road clearance.
 		if (Mesh != nullptr && Mesh->SkeletalMesh != nullptr)
 		{
-			float TargetRestHeight = -40.0f;
+			FBox ChassisBounds(ForceInit);
 			FBodyInstance* ChassisBody = Mesh->GetBodyInstance();
 			if (ChassisBody != nullptr && ChassisBody->BodySetup != nullptr)
 			{
-				const FBox ChassisBounds = ChassisBody->BodySetup->AggGeom.CalcAABB(
+				ChassisBounds = ChassisBody->BodySetup->AggGeom.CalcAABB(
 					FTransform(FQuat::Identity, FVector::ZeroVector,
 						Mesh->GetRelativeTransform().GetScale3D()));
-				if (ChassisBounds.IsValid)
-				{
-					TargetRestHeight = ChassisBounds.Min.Z + 30.0f - 10.0f;
-				}
 			}
 
-			for (FWheelSetup& WheelSetup : Movement->WheelSetups)
+			if (ChassisBounds.IsValid)
 			{
-				const float CurrentRestHeight =
-					GetWheelRestingPositionInChassisSpace(WheelSetup, Mesh).Z;
-				WheelSetup.AdditionalOffset.Z += TargetRestHeight - CurrentRestHeight;
+				for (FWheelSetup& WheelSetup : Movement->WheelSetups)
+				{
+					const UVehicleWheel* WheelDefaults = WheelSetup.WheelClass != nullptr
+						? WheelSetup.WheelClass->GetDefaultObject<UVehicleWheel>() : nullptr;
+					const float WheelRadius = WheelDefaults != nullptr
+						? WheelDefaults->ShapeRadius : 30.0f;
+					const float TargetRestHeight = ChassisBounds.Min.Z + WheelRadius;
+					const float CurrentRestHeight =
+						GetWheelRestingPositionInChassisSpace(WheelSetup, Mesh).Z;
+					WheelSetup.AdditionalOffset.Z += TargetRestHeight - CurrentRestHeight;
+				}
 			}
 		}
 
@@ -218,6 +318,8 @@ AUTVehicle_Goliath::AUTVehicle_Goliath(const FObjectInitializer& ObjectInitializ
 		TEXT("/Game/RestrictedAssets/Proto/UT3_Vehicles/VH_Goliath/Meshes/PA_Goliath_ChassisOnly"));
 	if (ChassisPhysicsFinder.Succeeded())
 	{
+		ConfigureGoliathChassisCollision(ChassisPhysicsFinder.Object,
+			MeshFinder.Succeeded() ? MeshFinder.Object : nullptr);
 		// UE4.15's SetPhysicsAsset() tries to rebuild articulated physics when a
 		// SkeletalMesh is already assigned and dereferences GetWorld(). CDO
 		// construction has no world, so set the public override directly; normal
@@ -267,6 +369,13 @@ AUTVehicle_Goliath::AUTVehicle_Goliath(const FObjectInitializer& ObjectInitializ
 	TankPivotYawRate = 60.0f;
 	TankMovingYawRate = 30.0f;
 	InsideTrackTorqueFactor = 0.25f;
+	TankMaxForwardSpeed = 1400.0f;
+	TankMaxReverseSpeed = 700.0f;
+	// Stay above the chassis material's maximum static-friction deceleration;
+	// otherwise a small per-frame velocity increment can be cancelled forever.
+	TankDriveAcceleration = 1600.0f;
+	TankBrakeDeceleration = 2200.0f;
+	TankLateralDamping = 6.0f;
 	TankShellClass = AUTProj_TankShell::StaticClass();
 	CannonMuzzleSocket = FName(TEXT("TurretFireSocket"));
 	CannonFireInterval = 2.5f;
@@ -279,7 +388,6 @@ AUTVehicle_Goliath::AUTVehicle_Goliath(const FObjectInitializer& ObjectInitializ
 		TEXT("/Game/Mogno/Vehicles/Goliath/SFX/A_Vehicle_Goliath_Fire01"));
 	CannonFireSound = CannonFireSoundFinder.Object;
 	bCannonFiring = false;
-	bSpawnParkingLocked = false;
 	NextCannonFireTime = -1000.0f;
 	LastCannonAimSendTime = -1000.0f;
 	ReplicatedCannonAim = FRotator::ZeroRotator;
@@ -325,7 +433,21 @@ void AUTVehicle_Goliath::PostInitializeComponents()
 		? ChassisBody->BodySetup->AggGeom.CalcAABB(FTransform(FQuat::Identity,
 			FVector::ZeroVector, GetMesh()->GetRelativeTransform().GetScale3D()))
 		: FBox(ForceInit);
-	UE_LOG(LogTemp, Warning, TEXT("[GoliathPhysics] Setup Physics=%d ChassisBone=%s ChassisZ=(%.2f..%.2f) ParkHeight=%.2f WheelOffsetZ=(%.2f,%.2f,%.2f,%.2f) WheelRestBodyZ=(%.2f,%.2f,%.2f,%.2f) WheelRestMeshZ=(%.2f,%.2f,%.2f,%.2f)"),
+	float WheelRestOffsetZ[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+	if (Movement != nullptr)
+	{
+		for (int32 WheelIndex = 0; WheelIndex < 4; ++WheelIndex)
+		{
+			FVector WorldPosition = FVector::ZeroVector;
+			if (Movement->WheelSetups.IsValidIndex(WheelIndex) &&
+				GetWheelRestingPositionInWorldSpace(Movement->WheelSetups[WheelIndex],
+					GetMesh(), WorldPosition))
+			{
+				WheelRestOffsetZ[WheelIndex] = WorldPosition.Z - GetActorLocation().Z;
+			}
+		}
+	}
+	UE_LOG(LogTemp, Warning, TEXT("[GoliathPhysics] Setup Physics=%d ChassisBone=%s ChassisZ=(%.2f..%.2f) ParkHeight=%.2f WheelOffsetZ=(%.2f,%.2f,%.2f,%.2f) WheelRestBodyZ=(%.2f,%.2f,%.2f,%.2f) WheelRestOffsetZ=(%.2f,%.2f,%.2f,%.2f)"),
 		Movement != nullptr && Movement->HasValidPhysicsState() ? 1 : 0,
 		ChassisBody != nullptr && ChassisBody->BodySetup != nullptr
 			? *ChassisBody->BodySetup->BoneName.ToString() : TEXT("NONE"),
@@ -340,21 +462,17 @@ void AUTVehicle_Goliath::PostInitializeComponents()
 		Movement != nullptr && Movement->WheelSetups.IsValidIndex(1) ? GetWheelRestingPositionInChassisSpace(Movement->WheelSetups[1], GetMesh()).Z : 0.0f,
 		Movement != nullptr && Movement->WheelSetups.IsValidIndex(2) ? GetWheelRestingPositionInChassisSpace(Movement->WheelSetups[2], GetMesh()).Z : 0.0f,
 		Movement != nullptr && Movement->WheelSetups.IsValidIndex(3) ? GetWheelRestingPositionInChassisSpace(Movement->WheelSetups[3], GetMesh()).Z : 0.0f,
-		Movement != nullptr && Movement->WheelSetups.IsValidIndex(0) ? GetWheelRestingPositionInMeshSpace(Movement->WheelSetups[0], GetMesh()).Z : 0.0f,
-		Movement != nullptr && Movement->WheelSetups.IsValidIndex(1) ? GetWheelRestingPositionInMeshSpace(Movement->WheelSetups[1], GetMesh()).Z : 0.0f,
-		Movement != nullptr && Movement->WheelSetups.IsValidIndex(2) ? GetWheelRestingPositionInMeshSpace(Movement->WheelSetups[2], GetMesh()).Z : 0.0f,
-		Movement != nullptr && Movement->WheelSetups.IsValidIndex(3) ? GetWheelRestingPositionInMeshSpace(Movement->WheelSetups[3], GetMesh()).Z : 0.0f);
+		WheelRestOffsetZ[0], WheelRestOffsetZ[1], WheelRestOffsetZ[2], WheelRestOffsetZ[3]);
 }
 
 void AUTVehicle_Goliath::BeginPlay()
 {
 	Super::BeginPlay();
 
-	// Spawners place every vehicle at a map-authored pad height. The Goliath's
-	// imported pivot and chassis are much taller than the Scorpion's, so Z=60 can
-	// start its wheels/chassis inside the floor. Correct that before the first
-	// PhysX vehicle update rather than asking depenetration and four stiff springs
-	// to eject a 10-ton overlap.
+	// Spawners use one map-authored pad height, but imported vehicle body origins
+	// differ. Place the Goliath from the actual PhysX wheel-rest transform before
+	// its first update instead of guessing from the skeletal pivot or asking
+	// depenetration and four stiff springs to resolve a 10-ton vertical error.
 	if (VehicleComponent != nullptr && !VehicleComponent->HasDriver())
 	{
 		float GroundZ = 0.0f;
@@ -363,25 +481,17 @@ void AUTVehicle_Goliath::BeginPlay()
 		{
 			FVector ParkedLocation = GetActorLocation();
 			ParkedLocation.Z = ParkedActorZ;
-			SetActorLocation(ParkedLocation, false, nullptr, ETeleportType::TeleportPhysics);
+			TeleportGoliathPhysics(GetMesh(), this, ParkedLocation, GetActorRotation());
 			GetMesh()->SetAllPhysicsLinearVelocity(FVector::ZeroVector);
 			GetMesh()->SetAllPhysicsAngularVelocity(FVector::ZeroVector);
 			GetMesh()->PutAllRigidBodiesToSleep();
 			if (UUTVehicleMovementTank* Movement = Cast<UUTVehicleMovementTank>(GetVehicleMovementComponent()))
 			{
-				// Sleeping is not a parking lock: PhysX may wake the body later and a
-				// single bad suspension/depenetration step can cross the entire map
-				// before the next actor tick. Disable physical response and gravity on
-				// the untouched spawn while retaining query collision, so the nearby
-				// entry prompt and RPC still see the tank. Keeping the body simulated
-				// also preserves the already-created PhysX vehicle state for entry.
+				// Keep the already-created chassis body collision-active and merely pause
+				// vehicle suspension/drive updates. Switching the root body from QueryOnly
+				// back to QueryAndPhysics on entry rebuilds its PhysX pose from the imported
+				// skeletal origin and launches the otherwise correctly parked tank.
 				Movement->Deactivate();
-			}
-			if (FBodyInstance* ChassisBody = GetMesh()->GetBodyInstance())
-			{
-				ChassisBody->SetCollisionEnabled(ECollisionEnabled::QueryOnly);
-				GetMesh()->SetEnableGravity(false);
-				bSpawnParkingLocked = true;
 			}
 			UE_LOG(LogTemp, Warning, TEXT("[GoliathParking] Spawn parked Vehicle=%s GroundZ=%.2f ActorZ=%.2f Height=%.2f"),
 				*GetName(), GroundZ, ParkedActorZ, GetParkedHeightAboveGround());
@@ -393,8 +503,9 @@ void AUTVehicle_Goliath::Tick(float DeltaSeconds)
 {
 	Super::Tick(DeltaSeconds);
 	UpdateCannonAim(DeltaSeconds);
-	ApplyTankSteering();
 	UpdateVacantParking(DeltaSeconds);
+	ApplyTankDrive(DeltaSeconds);
+	ApplyTankSteering();
 }
 
 void AUTVehicle_Goliath::GetLifetimeReplicatedProps(
@@ -490,12 +601,18 @@ float AUTVehicle_Goliath::GetParkedHeightAboveGround() const
 	}
 
 	const FWheelSetup& WheelSetup = Movement->WheelSetups[0];
-	const float LocalWheelCenterZ =
-		GetWheelRestingPositionInMeshSpace(WheelSetup, Mesh).Z;
+	FVector WorldWheelCenter = FVector::ZeroVector;
+	if (!GetWheelRestingPositionInWorldSpace(WheelSetup, Mesh, WorldWheelCenter))
+	{
+		return 100.0f;
+	}
 	const UVehicleWheel* WheelDefaults = WheelSetup.WheelClass->GetDefaultObject<UVehicleWheel>();
 	const float WheelRadius = WheelDefaults != nullptr ? WheelDefaults->ShapeRadius : 30.0f;
+	const float WheelCenterOffsetZ = WorldWheelCenter.Z - GetActorLocation().Z;
 	// Two units keep the tire touching the floor without beginning in penetration.
-	return FMath::Clamp(WheelRadius - LocalWheelCenterZ + 2.0f, 50.0f, 500.0f);
+	// Do not impose a positive actor-Z floor: imported skeletal pivots may validly
+	// sit below the road while their body-local wheel centres are on the surface.
+	return FMath::Clamp(WheelRadius - WheelCenterOffsetZ + 2.0f, -500.0f, 500.0f);
 }
 
 bool AUTVehicle_Goliath::FindParkingGround(float& OutGroundZ, float& OutParkedActorZ) const
@@ -533,20 +650,6 @@ void AUTVehicle_Goliath::UpdateVacantParking(float DeltaSeconds)
 	}
 	if (VehicleComponent->HasDriver())
 	{
-		if (bSpawnParkingLocked)
-		{
-			// Restore only the chassis body's physical response. Never recreate the
-			// skeletal or movement physics states here: doing so resurrects the
-			// imported turret/tread bodies that AUTVehicle deliberately strips out.
-			if (FBodyInstance* ChassisBody = GetMesh()->GetBodyInstance())
-			{
-				ChassisBody->SetCollisionEnabled(ECollisionEnabled::QueryAndPhysics);
-			}
-			GetMesh()->SetEnableGravity(true);
-			bSpawnParkingLocked = false;
-			UE_LOG(LogTemp, Warning, TEXT("[GoliathParking] Spawn lock released Vehicle=%s Role=%d Physics=%d"),
-				*GetName(), (int32)Role, GetMesh()->IsSimulatingPhysics() ? 1 : 0);
-		}
 		if (!Movement->IsActive())
 		{
 			Movement->Activate(true);
@@ -554,12 +657,6 @@ void AUTVehicle_Goliath::UpdateVacantParking(float DeltaSeconds)
 			UE_LOG(LogTemp, Warning, TEXT("[GoliathParking] Drive enabled Vehicle=%s Role=%d"),
 				*GetName(), (int32)Role);
 		}
-		return;
-	}
-	if (bSpawnParkingLocked)
-	{
-		// The rigid chassis cannot accumulate gravity, collision, suspension, or
-		// replication wake-up impulses while this first-spawn lock is active.
 		return;
 	}
 
@@ -602,7 +699,7 @@ void AUTVehicle_Goliath::UpdateVacantParking(float DeltaSeconds)
 		// Repair residual floor penetration without imparting an impulse.
 		FVector CorrectedLocation = GetActorLocation();
 		CorrectedLocation.Z = ParkedActorZ;
-		SetActorLocation(CorrectedLocation, false, nullptr, ETeleportType::TeleportPhysics);
+		TeleportGoliathPhysics(GetMesh(), this, CorrectedLocation, GetActorRotation());
 		GetMesh()->SetAllPhysicsLinearVelocity(FVector::ZeroVector);
 		GetMesh()->SetAllPhysicsAngularVelocity(FVector::ZeroVector);
 	}
@@ -616,12 +713,74 @@ void AUTVehicle_Goliath::UpdateVacantParking(float DeltaSeconds)
 		FRotator ParkedRotation = GetActorRotation();
 		ParkedRotation.Pitch = 0.0f;
 		ParkedRotation.Roll = 0.0f;
-		SetActorLocationAndRotation(ParkedLocation, ParkedRotation, false, nullptr,
-			ETeleportType::TeleportPhysics);
+		TeleportGoliathPhysics(GetMesh(), this, ParkedLocation, ParkedRotation);
 		GetMesh()->SetAllPhysicsLinearVelocity(FVector::ZeroVector);
 		GetMesh()->SetAllPhysicsAngularVelocity(FVector::ZeroVector);
 		GetMesh()->PutAllRigidBodiesToSleep();
 	}
+}
+
+void AUTVehicle_Goliath::ApplyTankDrive(float DeltaSeconds)
+{
+	if ((Role != ROLE_Authority && !IsLocallyControlled()) || DeltaSeconds <= 0.0f)
+	{
+		return;
+	}
+
+	UUTVehicleMovementTank* Movement = Cast<UUTVehicleMovementTank>(GetVehicleMovementComponent());
+	USkeletalMeshComponent* Mesh = GetMesh();
+	if (Movement == nullptr || Mesh == nullptr || !Mesh->IsSimulatingPhysics() ||
+		VehicleComponent == nullptr || !VehicleComponent->HasDriver() || VehicleComponent->bDead)
+	{
+		return;
+	}
+
+	// The imported Goliath's road-wheel bones are decorative pivots inside the
+	// tread assembly. Even at maximum suspension droop their generated PhysX
+	// contacts can remain above the road, producing engine RPM but zero tire
+	// force. Drive the one rigid chassis directly from the same replicated input
+	// state instead of making locomotion depend on those fake contacts.
+	float GroundZ = 0.0f;
+	float ParkedActorZ = 0.0f;
+	if (!FindParkingGround(GroundZ, ParkedActorZ) ||
+		FMath::Abs(GetActorLocation().Z - ParkedActorZ) > 160.0f)
+	{
+		// Do not grant tank-style air control after a launch or fall.
+		return;
+	}
+
+	FVector Forward = GetActorForwardVector();
+	Forward.Z = 0.0f;
+	if (!Forward.Normalize())
+	{
+		return;
+	}
+
+	const float Throttle = FMath::Clamp(Movement->GetAppliedSignedThrottle(), -1.0f, 1.0f);
+	const FVector CurrentVelocity = Mesh->GetPhysicsLinearVelocity();
+	const FVector PlanarVelocity(CurrentVelocity.X, CurrentVelocity.Y, 0.0f);
+	const float CurrentForwardSpeed = FVector::DotProduct(PlanarVelocity, Forward);
+	const FVector CurrentLateralVelocity = PlanarVelocity - Forward * CurrentForwardSpeed;
+
+	const float DirectionalMaxSpeed = Throttle >= 0.0f
+		? TankMaxForwardSpeed : TankMaxReverseSpeed;
+	const float TargetForwardSpeed = Throttle * DirectionalMaxSpeed;
+	const bool bChangingDirection = FMath::Abs(Throttle) > 0.01f &&
+		FMath::Abs(CurrentForwardSpeed) > 10.0f &&
+		FMath::Sign(CurrentForwardSpeed) != FMath::Sign(TargetForwardSpeed);
+	const float Acceleration = FMath::Abs(Throttle) <= 0.01f || bChangingDirection
+		? TankBrakeDeceleration : TankDriveAcceleration;
+	const float NewForwardSpeed = FMath::FInterpConstantTo(CurrentForwardSpeed,
+		TargetForwardSpeed, DeltaSeconds, Acceleration);
+
+	// Continuous treads strongly reject lateral slip. Preserve vertical velocity
+	// so gravity, ramps, cannon recoil, and collision response remain physical.
+	const float LateralScale = FMath::Clamp(1.0f - TankLateralDamping * DeltaSeconds,
+		0.0f, 1.0f);
+	const FVector NewVelocity = Forward * NewForwardSpeed +
+		CurrentLateralVelocity * LateralScale +
+		FVector::UpVector * CurrentVelocity.Z;
+	Mesh->SetAllPhysicsLinearVelocity(NewVelocity);
 }
 
 void AUTVehicle_Goliath::ApplyTankSteering()

@@ -7,6 +7,8 @@
 class UParticleSystem;
 class UStaticMesh;
 class USoundBase;
+class AUTImpactEffect;
+class AUTProjectile;
 class AUTProj_ScorpionGlob;
 
 /**
@@ -72,7 +74,7 @@ public:
 	float BoostAcceleration;
 
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Scorpion|Gun")
-	TSubclassOf<AUTProj_ScorpionGlob> GunProjectileClass;
+	TSubclassOf<AUTProjectile> GunProjectileClass;
 
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Scorpion|Gun")
 	FName GunMuzzleSocket;
@@ -151,6 +153,18 @@ public:
 	/** Original UT3 boost-eject explosion, imported into the UT4 content tree. */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Scorpion|Self Destruct")
 	UParticleSystem* SelfDestructEffect;
+
+	/** Full UT4 explosion layered under the imported UT3 fire/smoke system. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Scorpion|Self Destruct")
+	TSubclassOf<AUTImpactEffect> SelfDestructBlastEffect;
+
+	/** World scale for the imported UT3 fire/smoke system. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Scorpion|Self Destruct")
+	float SelfDestructEffectScale;
+
+	/** World scale for the full flash, fireball, smoke, and audio blast. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Scorpion|Self Destruct")
+	float SelfDestructBlastScale;
 
 	/** Locally simulated hatch debris spawned for the boost-eject explosion. */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Scorpion|Self Destruct")

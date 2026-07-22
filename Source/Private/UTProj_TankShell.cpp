@@ -1,4 +1,5 @@
 #include "UTProj_TankShell.h"
+#include "UnrealTournament.h"
 #include "UTVehicleDamageType.h"
 #include "Components/StaticMeshComponent.h"
 #include "Engine/StaticMesh.h"

@@ -9,8 +9,9 @@ class UParticleSystem;
 class USoundBase;
 
 /**
- * Native UT3 Goliath driver vehicle. The chassis is a four-contact PhysX
- * vehicle with native skid-steer yaw; the driver owns the main cannon.
+ * Native UT3 Goliath driver vehicle. The chassis keeps a four-contact PhysX
+ * vehicle for engine/input replication, while native tracked drive and
+ * skid-steer forces move the rigid chassis; the driver owns the main cannon.
  * Passenger weapons intentionally wait for the reusable seat system.
  */
 UCLASS(Blueprintable)
@@ -40,6 +41,24 @@ public:
 	/** UT3 inside-track torque fraction, used to reduce high-speed turning. */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Goliath|Movement")
 	float InsideTrackTorqueFactor;
+
+	/** Native tracked-drive top speed; independent of decorative wheel contact. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Goliath|Movement")
+	float TankMaxForwardSpeed;
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Goliath|Movement")
+	float TankMaxReverseSpeed;
+
+	/** Grounded forward/reverse acceleration in Unreal units per second squared. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Goliath|Movement")
+	float TankDriveAcceleration;
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Goliath|Movement")
+	float TankBrakeDeceleration;
+
+	/** Track-like resistance to sideways chassis sliding while grounded. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Goliath|Movement")
+	float TankLateralDamping;
 
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Goliath|Cannon")
 	TSubclassOf<AUTProj_TankShell> TankShellClass;
@@ -84,6 +103,7 @@ protected:
 	void SetCannonFiring(bool bNewFiring);
 	void FireCannon();
 	void UpdateCannonAim(float DeltaSeconds);
+	void ApplyTankDrive(float DeltaSeconds);
 	void ApplyTankSteering();
 	void UpdateVacantParking(float DeltaSeconds);
 	bool FindParkingGround(float& OutGroundZ, float& OutParkedActorZ) const;
@@ -96,8 +116,6 @@ protected:
 	FRotator ReplicatedCannonAim;
 
 	bool bCannonFiring;
-	/** Hard physics-response lock used only before this spawn receives its first driver. */
-	bool bSpawnParkingLocked;
 	float NextCannonFireTime;
 	float LastCannonAimSendTime;
 	FRotator CurrentCannonAim;

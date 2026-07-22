@@ -1,4 +1,5 @@
 #include "UTProj_ScorpionGlob.h"
+#include "UnrealTournament.h"
 #include "UTVehicleDamageType.h"
 #include "Components/SphereComponent.h"
 #include "GameFramework/ProjectileMovementComponent.h"

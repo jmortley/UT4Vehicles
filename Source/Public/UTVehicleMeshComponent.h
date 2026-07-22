@@ -15,6 +15,10 @@ class UTVEHICLES_API UUTVehicleMeshComponent : public USkeletalMeshComponent
 	GENERATED_UCLASS_BODY()
 
 public:
+	/** Whether PhysX wheel locations should be copied onto the rendered wheel bones. */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Vehicle)
+	bool bApplyWheelPose;
+
 	/** Mesh-space lift applied after matching a visual wheel to its PhysX center. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = Vehicle)
 	float VisualWheelCenterOffsetZ;
